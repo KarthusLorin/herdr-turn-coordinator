@@ -1,0 +1,24 @@
+id = "karthuslorin.turn-coordinator"
+name = "Turn Coordinator"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Run one interactive agent turn without model-driven polling"
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "install-cli"
+title = "Install herdr-turn CLI"
+contexts = ["workspace"]
+command = ["python3", "herdr_turn.py", "install-cli"]
+
+[[actions]]
+id = "uninstall-cli"
+title = "Uninstall herdr-turn CLI"
+contexts = ["workspace"]
+command = ["python3", "herdr_turn.py", "uninstall-cli"]
+
+[[actions]]
+id = "doctor"
+title = "Check turn coordinator"
+contexts = ["workspace"]
+command = ["python3", "herdr_turn.py", "doctor"]
