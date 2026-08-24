@@ -19,6 +19,8 @@ Turn Coordinator moves that recovery loop into an ordinary local process. On a f
 
 ## Install
 
+Recommended Herdr plugin installation:
+
 ```sh
 herdr plugin install KarthusLorin/herdr-turn-coordinator
 herdr plugin action invoke karthuslorin.turn-coordinator.install-cli
@@ -27,6 +29,13 @@ herdr-turn doctor
 ```
 
 Plugin actions are asynchronous. Confirm the install action log says `succeeded` before running `doctor`, and ensure `~/.local/bin` is on `PATH`.
+
+Alternatively, install the CLI from npm:
+
+```sh
+npm install --global herdr-turn-coordinator --registry=https://registry.npmjs.org/
+herdr-turn doctor
+```
 
 ## Usage
 
@@ -96,6 +105,12 @@ This plugin coordinates interactive Herdr agents. Outside Herdr, use the downstr
 herdr plugin action invoke karthuslorin.turn-coordinator.uninstall-cli
 herdr plugin log list --plugin karthuslorin.turn-coordinator --limit 1
 herdr plugin uninstall karthuslorin.turn-coordinator
+```
+
+For an npm installation:
+
+```sh
+npm uninstall --global herdr-turn-coordinator --registry=https://registry.npmjs.org/
 ```
 
 ## License

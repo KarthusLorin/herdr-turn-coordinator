@@ -234,15 +234,15 @@ def main():
         if result.returncode:
             fail("herdr_unavailable", detail=payload(result))
         source = Path(__file__).resolve()
-        installed = CLI_PATH.is_symlink() and CLI_PATH.resolve(strict=False) == source
-        on_path = shutil.which("herdr-turn") == str(CLI_PATH)
+        cli = shutil.which("herdr-turn")
+        installed = bool(cli) and Path(cli).resolve(strict=False) == source
         print(json.dumps({
-            "ok": installed and on_path,
+            "ok": installed,
             "herdr": result.stdout.strip(),
+            "cli": cli,
             "installed": installed,
-            "on_path": on_path,
         }, ensure_ascii=False))
-        raise SystemExit(0 if installed and on_path else 1)
+        raise SystemExit(0 if installed else 1)
 
     if os.environ.get("HERDR_ENV") != "1":
         fail("not_inside_herdr")

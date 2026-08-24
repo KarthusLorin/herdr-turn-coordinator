@@ -1,0 +1,40 @@
+{
+  "name": "herdr-turn-coordinator",
+  "version": "0.1.0",
+  "description": "Preserve interactive Herdr agent TUIs without model-driven status polling",
+  "license": "MIT",
+  "author": "KarthusLorin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KarthusLorin/herdr-turn-coordinator.git"
+  },
+  "homepage": "https://github.com/KarthusLorin/herdr-turn-coordinator#readme",
+  "bugs": {
+    "url": "https://github.com/KarthusLorin/herdr-turn-coordinator/issues"
+  },
+  "bin": {
+    "herdr-turn": "herdr_turn.py"
+  },
+  "files": [
+    "herdr_turn.py",
+    "herdr-plugin.toml"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest -v",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "herdr",
+    "ai-agents",
+    "cli",
+    "terminal"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
