@@ -70,6 +70,7 @@ then consume its single final JSON result. Do not poll Herdr from model turns.
 
 - Preserves the native interactive TUI; it never substitutes `kimi -p`, `grok --single`, or another batch mode.
 - Rejects prompts to agents reported as `working`, `blocked`, or `unknown`.
+- Leaves Kimi's first-run folder-trust prompt untouched for manual confirmation.
 - Uses Herdr's native blocking wait first.
 - On `agent_prompt_stalled`, falls back only after a revision advance plus a new prompt anchor or a recovered `working` state.
 - Uses native lifecycle waiting once Herdr reports `working`; otherwise a local 15-second revision-quiet heuristic returns `unknown` without declaring success.

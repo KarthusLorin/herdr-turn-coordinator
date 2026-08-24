@@ -87,6 +87,13 @@ def contains_new_prompt(before, after, prompt):
     return False
 
 
+def requires_manual_setup(text):
+    text = " ".join(text.lower().split())
+    return "trust this folder?" in text and (
+        "don't trust" in text or "enable project mcp servers" in text
+    )
+
+
 def wait_for_quiet(target, pane_id, delivered_revision, timeout):
     deadline = time.monotonic() + max(0, timeout - 5000) / 1000
     revision = delivered_revision
@@ -120,6 +127,10 @@ def wait_for_quiet(target, pane_id, delivered_revision, timeout):
 
 def submit(target, prompt, timeout, lines, baseline_revision):
     before = call("agent", "read", target, "--source", "visible")
+    if before.returncode:
+        fail("agent_preflight_read_failed", detail=payload(before))
+    if requires_manual_setup(before.stdout):
+        fail("agent_requires_manual_setup", target=target)
     result = call("agent", "prompt", target, prompt, "--wait", "--timeout", str(timeout))
     if result.returncode:
         state = call("agent", "get", target)
