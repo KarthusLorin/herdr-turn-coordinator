@@ -1,6 +1,6 @@
 {
   "name": "herdr-turn-coordinator",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Preserve interactive Herdr agent TUIs without model-driven status polling",
   "license": "MIT",
   "author": "KarthusLorin",
