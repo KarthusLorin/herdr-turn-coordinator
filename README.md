@@ -80,7 +80,7 @@ herdr-turn prompt \
   --prompt "Now summarize the top three risks."
 ```
 
-Both commands block until the turn settles or the timeout expires, then print one JSON object. The default timeout is 300000 ms. The created pane stays open and the agent remains fully interactive.
+Both commands block until the turn settles or the timeout expires, then print one JSON object. The default timeout is `300000` ms. Timeouts accept explicit units such as `600ms`, `600s`, and `10m`; bare values remain milliseconds for compatibility. Ambiguous bare values below `1000` are rejected with a unit hint. The created pane stays open and the agent remains fully interactive.
 
 ```json
 {

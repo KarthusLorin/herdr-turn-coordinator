@@ -32,6 +32,22 @@ def fail(message, **details):
     raise SystemExit(1)
 
 
+def parse_timeout(value):
+    value = value.strip().lower()
+    match = re.fullmatch(r"(\d+)(ms|s|m)?", value)
+    if not match:
+        raise argparse.ArgumentTypeError("timeout must look like 300000, 600ms, 600s, or 10m")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if amount <= 0:
+        raise argparse.ArgumentTypeError("timeout must be greater than zero")
+    if unit is None and amount < 1000:
+        raise argparse.ArgumentTypeError(
+            "bare timeouts are milliseconds; add a unit, e.g. 600s or 10m"
+        )
+    return amount * {None: 1, "ms": 1, "s": 1000, "m": 60000}[unit]
+
+
 def install_cli():
     source = Path(__file__).resolve()
     CLI_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -219,13 +235,19 @@ def main():
     run.add_argument("--kind", required=True)
     run.add_argument("--prompt", required=True)
     run.add_argument("--name")
-    run.add_argument("--timeout", type=int, default=300000)
+    run.add_argument(
+        "--timeout", type=parse_timeout, default=300000, metavar="DURATION",
+        help="turn timeout; bare values are milliseconds (default: 300000); accepts ms, s, or m",
+    )
     run.add_argument("--lines", type=int, default=160)
 
     prompt = sub.add_parser("prompt")
     prompt.add_argument("--target", required=True)
     prompt.add_argument("--prompt", required=True)
-    prompt.add_argument("--timeout", type=int, default=300000)
+    prompt.add_argument(
+        "--timeout", type=parse_timeout, default=300000, metavar="DURATION",
+        help="turn timeout; bare values are milliseconds (default: 300000); accepts ms, s, or m",
+    )
     prompt.add_argument("--lines", type=int, default=160)
 
     sub.add_parser("doctor")
