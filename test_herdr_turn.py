@@ -21,7 +21,7 @@ class PaneLayoutTest(unittest.TestCase):
         }
         self.assertEqual(choose_split(layout, "caller"), ("child-1", "down"))
 
-    def test_prefers_the_caller_when_largest_panes_tie(self):
+    def test_protects_the_caller_when_largest_panes_tie(self):
         layout = {
             "area": {"width": 200, "height": 60},
             "panes": [
@@ -29,7 +29,16 @@ class PaneLayoutTest(unittest.TestCase):
                 {"pane_id": "caller", "rect": {"width": 100, "height": 60}},
             ],
         }
-        self.assertEqual(choose_split(layout, "caller"), ("caller", "down"))
+        self.assertEqual(choose_split(layout, "caller"), ("child", "down"))
+
+    def test_splits_the_caller_when_it_is_the_only_pane(self):
+        layout = {
+            "area": {"width": 200, "height": 60},
+            "panes": [
+                {"pane_id": "caller", "rect": {"width": 200, "height": 60}},
+            ],
+        }
+        self.assertEqual(choose_split(layout, "caller"), ("caller", "right"))
 
 
 class TimeoutParsingTest(unittest.TestCase):

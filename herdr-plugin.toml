@@ -1,6 +1,6 @@
 id = "karthuslorin.turn-coordinator"
 name = "Turn Coordinator"
-version = "0.1.3"
+version = "0.1.5"
 min_herdr_version = "0.8.0"
 description = "Run one interactive agent turn without model-driven polling"
 platforms = ["macos", "linux"]

@@ -209,8 +209,14 @@ def choose_split(layout, caller_pane_id):
         if isinstance(pane.get("pane_id"), str) and width > 0 and height > 0:
             panes.append((width * height, pane["pane_id"] == caller_pane_id, pane["pane_id"], width, height))
 
-    if panes:
-        _, _, pane_id, width, height = max(panes)
+    # Protect the main viewport: prefer splitting the largest non-caller pane so
+    # the caller's pane is only ever split once (when it is the sole pane). This
+    # keeps the user's primary viewport at a stable size no matter how many
+    # sub-agents are spawned.
+    workers = [pane for pane in panes if not pane[1]]
+    pool = workers or panes
+    if pool:
+        _, _, pane_id, width, height = max(pool)
         return pane_id, "right" if width >= height * 2 else "down"
 
     area = layout["area"]
