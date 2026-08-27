@@ -6,7 +6,30 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from herdr_turn import contains_new_prompt, parse_timeout, requires_manual_setup, submit
+from herdr_turn import choose_split, contains_new_prompt, parse_timeout, requires_manual_setup, submit
+
+
+class PaneLayoutTest(unittest.TestCase):
+    def test_splits_the_largest_pane_to_form_a_grid(self):
+        layout = {
+            "area": {"width": 200, "height": 60},
+            "panes": [
+                {"pane_id": "caller", "rect": {"width": 100, "height": 30}},
+                {"pane_id": "child-1", "rect": {"width": 100, "height": 60}},
+                {"pane_id": "child-2", "rect": {"width": 100, "height": 30}},
+            ],
+        }
+        self.assertEqual(choose_split(layout, "caller"), ("child-1", "down"))
+
+    def test_prefers_the_caller_when_largest_panes_tie(self):
+        layout = {
+            "area": {"width": 200, "height": 60},
+            "panes": [
+                {"pane_id": "child", "rect": {"width": 100, "height": 60}},
+                {"pane_id": "caller", "rect": {"width": 100, "height": 60}},
+            ],
+        }
+        self.assertEqual(choose_split(layout, "caller"), ("caller", "down"))
 
 
 class TimeoutParsingTest(unittest.TestCase):

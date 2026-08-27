@@ -197,15 +197,34 @@ def submit(target, prompt, timeout, lines, baseline_revision):
     raise SystemExit(0 if output["ok"] else 2)
 
 
+def choose_split(layout, caller_pane_id):
+    panes = []
+    for pane in layout.get("panes", []):
+        rect = pane.get("rect", {})
+        try:
+            width = float(rect["width"])
+            height = float(rect["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if isinstance(pane.get("pane_id"), str) and width > 0 and height > 0:
+            panes.append((width * height, pane["pane_id"] == caller_pane_id, pane["pane_id"], width, height))
+
+    if panes:
+        _, _, pane_id, width, height = max(panes)
+        return pane_id, "right" if width >= height * 2 else "down"
+
+    area = layout["area"]
+    return None, "right" if area["width"] >= area["height"] * 2 else "down"
+
+
 def start_agent(kind, name, timeout):
     layout = call("pane", "layout", "--pane", os.environ["HERDR_PANE_ID"])
     if layout.returncode:
         fail("pane_layout_failed", detail=payload(layout))
-    area = payload(layout)["result"]["layout"]["area"]
-    direction = "right" if area["width"] >= 120 and area["width"] >= area["height"] * 2 else "down"
+    target, direction = choose_split(payload(layout)["result"]["layout"], os.environ["HERDR_PANE_ID"])
 
     split = call(
-        "pane", "split", "--current", "--direction", direction,
+        "pane", "split", *(('--pane', target) if target else ('--current',)), "--direction", direction,
         "--cwd", os.getcwd(), "--no-focus",
     )
     if split.returncode:
