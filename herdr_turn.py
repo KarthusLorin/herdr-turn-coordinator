@@ -12,6 +12,12 @@ from pathlib import Path
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 CLI_PATH = Path.home() / ".local" / "bin" / "herdr-turn"
 
+# Herdr's `agent prompt --wait` / `agent wait` support waiting indefinitely, so
+# the turn timeout is only an upper ceiling, not a polling cadence. 30 minutes
+# covers complex multi-step turns; short hangs still surface via the fallback
+# revision-quiet detector below.
+DEFAULT_TURN_TIMEOUT_MS = 1_800_000
+
 
 def call(*args):
     return subprocess.run(
@@ -123,7 +129,9 @@ def wait_for_quiet(target, pane_id, delivered_revision, timeout):
         if status == "blocked":
             return "blocked", "blocked"
         if status == "working":
-            remaining = min(max(int((deadline - time.monotonic()) * 1000), 3001), 300000)
+            # `herdr agent wait` waits indefinitely and advertises no maximum, so
+            # only floor the remaining budget; clamping it here truncated long turns.
+            remaining = max(int((deadline - time.monotonic()) * 1000), 3001)
             settled = call("agent", "wait", target, "--timeout", str(remaining))
             if settled.returncode:
                 fail("agent_wait_failed", detail=payload(settled))
@@ -135,7 +143,7 @@ def wait_for_quiet(target, pane_id, delivered_revision, timeout):
         if current != revision:
             revision = current
             last_change = time.monotonic()
-        if time.monotonic() - last_change >= 15:
+        if time.monotonic() - last_change >= 60:
             return "unknown", "output_quiet"
         time.sleep(0.5)
     fail("agent_quiet_timeout", pane_id=pane_id, revision=revision)
@@ -159,10 +167,24 @@ def submit(target, prompt, timeout, lines, baseline_revision):
             and text.returncode == 0
             and contains_new_prompt(before.stdout, text.stdout, prompt)
         )
+        stalled = prompt_error.get("error", {}).get("code") == "agent_prompt_stalled"
+        grok_needs_enter = (
+            stalled
+            and agent.get("agent") == "grok"
+            and agent.get("agent_status") in {"idle", "done"}
+            and screen_confirms_delivery
+        )
+        if grok_needs_enter:
+            entered = call("agent", "send-keys", target, "enter")
+            if entered.returncode:
+                fail("agent_enter_failed", detail=payload(entered))
         if (
-            prompt_error.get("error", {}).get("code") == "agent_prompt_stalled"
-            and agent.get("revision", baseline_revision) > baseline_revision
-            and (status_confirms_delivery or screen_confirms_delivery)
+            grok_needs_enter
+            or (
+                stalled
+                and agent.get("revision", baseline_revision) > baseline_revision
+                and (status_confirms_delivery or screen_confirms_delivery)
+            )
         ):
             status, wait_mode = wait_for_quiet(target, agent["pane_id"], agent["revision"], timeout)
             final_text = read_once(target, lines) if wait_mode == "native_wait" and status in {"idle", "done"} else read_visible(target)
@@ -261,8 +283,8 @@ def main():
     run.add_argument("--prompt", required=True)
     run.add_argument("--name")
     run.add_argument(
-        "--timeout", type=parse_timeout, default=300000, metavar="DURATION",
-        help="turn timeout; bare values are milliseconds (default: 300000); accepts ms, s, or m",
+        "--timeout", type=parse_timeout, default=DEFAULT_TURN_TIMEOUT_MS, metavar="DURATION",
+        help="turn timeout; bare values are milliseconds (default: 1800000); accepts ms, s, or m",
     )
     run.add_argument("--lines", type=int, default=160)
 
@@ -270,8 +292,8 @@ def main():
     prompt.add_argument("--target", required=True)
     prompt.add_argument("--prompt", required=True)
     prompt.add_argument(
-        "--timeout", type=parse_timeout, default=300000, metavar="DURATION",
-        help="turn timeout; bare values are milliseconds (default: 300000); accepts ms, s, or m",
+        "--timeout", type=parse_timeout, default=DEFAULT_TURN_TIMEOUT_MS, metavar="DURATION",
+        help="turn timeout; bare values are milliseconds (default: 1800000); accepts ms, s, or m",
     )
     prompt.add_argument("--lines", type=int, default=160)
 

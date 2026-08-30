@@ -10,7 +10,7 @@ The plugin keeps the downstream agent's native TUI, splits a dedicated pane with
 
 `herdr agent prompt --wait` can report `agent_prompt_stalled` even when a prompt was delivered and the agent continues working. A parent model that recovers by repeatedly calling `agent get`, `agent read`, or `agent wait` pays for every observation as another model turn.
 
-Turn Coordinator moves that wait into a local process. On a false stall it checks for a new prompt on screen or a recovered `working` state, then waits. If it only sees 15 seconds of quiet pane output, it returns `unknown` for human takeover instead of declaring the turn done. It never resends the same prompt.
+Turn Coordinator moves that wait into a local process. On a false stall it checks for a new prompt on screen or a recovered `working` state, then waits. If Grok leaves the confirmed prompt queued while idle, it presses Enter once before waiting. If it only sees 60 seconds of quiet pane output, it returns `unknown` for human takeover instead of declaring the turn done. It never resends the same prompt.
 
 ## Requirements
 
@@ -80,7 +80,7 @@ herdr-turn prompt \
   --prompt "Now summarize the top three risks."
 ```
 
-Both commands block until the turn settles or the timeout expires, then print one JSON object. The default timeout is `300000` ms. Timeouts accept explicit units such as `600ms`, `600s`, and `10m`; bare values remain milliseconds for compatibility. Ambiguous bare values below `1000` are rejected with a unit hint. The created pane stays open and the agent remains fully interactive.
+Both commands block until the turn settles or the timeout expires, then print one JSON object. The default timeout is `1800000` ms (30 minutes). Timeouts accept explicit units such as `600ms`, `600s`, and `10m`; bare values remain milliseconds for compatibility. Ambiguous bare values below `1000` are rejected with a unit hint. The created pane stays open and the agent remains fully interactive.
 
 ```json
 {
@@ -108,8 +108,8 @@ then consume its single final JSON result. Do not poll Herdr from model turns.
 - Rejects prompts to agents reported as `working`, `blocked`, or `unknown`.
 - Leaves Kimi's first-run folder-trust prompt untouched for manual confirmation.
 - Uses Herdr's native blocking wait first.
-- On `agent_prompt_stalled`, falls back only after a revision advance plus a new prompt anchor or a recovered `working` state.
-- Uses native lifecycle waiting once Herdr reports `working`; otherwise a local 15-second revision-quiet heuristic returns `unknown` without declaring success.
+- On `agent_prompt_stalled`, falls back after a revision advance plus a new prompt anchor or a recovered `working` state. For an idle Grok pane with the new prompt visible, it presses Enter once and then waits with the original turn timeout.
+- Uses native lifecycle waiting once Herdr reports `working`; otherwise a local 60-second revision-quiet heuristic returns `unknown` without declaring success.
 - Reads history once only after confirmed completion. Blocked or uncertain turns read the visible screen without scrolling the live TUI.
 - Never resends a stalled prompt automatically.
 
