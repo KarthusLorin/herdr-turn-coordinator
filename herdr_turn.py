@@ -203,21 +203,37 @@ def contains_new_prompt(before, after, prompt):
 
 # ponytail: startup gates that appear before the composer and whose answer is
 # task-independent. Each entry is matched by BOTH its confirm label and a second
-# distinctive marker, so an unrelated dialog cannot match by accident. Labels and
-# key sequences below were captured from a live Claude Code 2.1.258 pane in an
-# untrusted git root; re-capture them before widening this table. Every one of
-# these dialogs defaults its focus to the refusing option, so the sequence must
-# move the selection before confirming -- never send a bare Enter.
+# distinctive marker, so an unrelated dialog cannot match by accident, and each is
+# scoped to the CLI kinds whose key layout was actually captured -- two CLIs can
+# word the same gate identically while ordering its options differently.
+#
+# Captured from live panes: Claude Code 2.1.258 in an untrusted git root, and Kimi
+# Code (dist/main.mjs trust-prompt.ts, confirmed against a rendered pane). Every
+# one of these dialogs defaults its focus to the refusing option, so the sequence
+# must move the selection before confirming -- never send a bare Enter. Kimi moves
+# Up where Claude moves Down, which is why "keys" cannot be shared across kinds.
+# Re-capture before widening this table.
 STARTUP_GATES = (
     {
+        "kinds": ("claude",),
         "confirm": "yes, i trust this folder",
         "marker": "accessing workspace",
         "keys": ("Down", "Enter"),
     },
     {
+        "kinds": ("claude",),
         "confirm": "yes, allow external imports",
         "marker": "external imports:",
         "keys": ("Down", "Enter"),
+    },
+    {
+        # Kimi renders "Trust this folder?" with the pointer parked on "Don't
+        # trust", whose description is "Exit Kimi Code" -- a bare Enter here quits
+        # the CLI, and Claude's Down would move further from the accepting option.
+        "kinds": ("kimi",),
+        "confirm": "trust this folder",
+        "marker": "enable project mcp servers",
+        "keys": ("Up", "Enter"),
     },
 )
 
@@ -226,9 +242,18 @@ def normalize_gate_screen(text):
     return " ".join(text.lower().split())
 
 
-def match_startup_gate(text):
+def match_startup_gate(text, kind=None):
+    """The gate on this screen, or None.
+
+    A gate matches only when `kind` is one it was captured on. Passing kind=None
+    means "no CLI identified", which matches nothing: an unidentified pane falls
+    through to requires_manual_setup rather than being answered with another
+    CLI's key layout.
+    """
     screen = normalize_gate_screen(text)
     for gate in STARTUP_GATES:
+        if kind not in gate["kinds"]:
+            continue
         if gate["confirm"] in screen and gate["marker"] in screen:
             return gate
     return None
@@ -238,41 +263,78 @@ def match_startup_gate(text):
 # been verified for them. Naming them buys a fast, legible failure instead of a
 # prompt typed into a dialog or a silent wait until the turn's timeout.
 UNANSWERED_GATE_MARKERS = (
-    "trust this folder?",          # kimi's wording; its key layout is unverified
     "don't trust",
-    "enable project mcp servers",
     "hooks need review",
     "press t to trust",
     "modified since last trusted",
 )
 
+# Sign-in and credential screens. These also sit before the composer, but no key
+# answers them -- they need a human, a browser, or a refreshed token. Naming them
+# turns a silent wait until the turn's timeout into an immediate, legible failure.
+# Strings taken from the shipped binaries: Claude Code 2.1.258, Codex 0.152.0,
+# TraeCLI 0.202.1, and Kimi Code.
+AUTH_GATE_MARKERS = (
+    "select login method",
+    "how do you want to sign in?",
+    "sign in with chatgpt",
+    "sign in with account password",
+    "login with personal access token",
+    "paste or type your api key",
+    "invalid api key",
+    "please run /login",
+    "is not signed in on this machine",
+    "login required",
+    "session expired",
+    "please log in again",
+    "credit balance is too low",
+)
 
-def requires_manual_setup(text):
-    """True when the pane sits on a gate this coordinator will not answer itself."""
+
+def gate_blocking_reason(text, kind=None):
+    """Why this screen needs a human, or None when it does not.
+
+    Answerable gates return None: clear_startup_gates handles those. Everything
+    else that we can name is reported by category, so the failure says whether to
+    click a dialog or to go re-authenticate.
+    """
     screen = normalize_gate_screen(text)
-    if match_startup_gate(text):
-        return False
+    if match_startup_gate(text, kind):
+        return None
+    if any(marker in screen for marker in AUTH_GATE_MARKERS):
+        return "authentication"
     if any(marker in screen for marker in UNANSWERED_GATE_MARKERS):
-        return True
+        return "unverified_gate"
+    if "trust this folder?" in screen:
+        # Some other CLI's trust dialog, or a kind we have no key layout for.
+        return "unverified_gate"
     # An unrecognized confirmation prompt: refuse rather than guess a key.
-    return "enter to confirm" in screen and "esc to cancel" in screen
+    if "enter to confirm" in screen and "esc to cancel" in screen:
+        return "unknown_confirmation"
+    return None
 
 
-def clear_startup_gates(pane_id):
+def requires_manual_setup(text, kind=None):
+    """True when the pane sits on a gate this coordinator will not answer itself."""
+    return gate_blocking_reason(text, kind) is not None
+
+
+def clear_startup_gates(pane_id, kind=None):
     """Answer known pre-composer gates in a pane, verifying each one cleared.
 
     Reads the pane rather than the agent: these gates block startup before the
     agent is registered, so `agent read` is not available yet. Bounded,
-    closed-loop, and fail-closed -- only gates in STARTUP_GATES are answered,
-    each answer is verified by re-reading the screen, and anything unrecognized
-    is left untouched for the caller to report. Returns how many it cleared.
+    closed-loop, and fail-closed -- only gates in STARTUP_GATES that were
+    captured on this `kind` are answered, each answer is verified by re-reading
+    the screen, and anything unrecognized is left untouched for the caller to
+    report. Returns how many it cleared.
     """
     cleared = 0
     for _ in range(len(STARTUP_GATES) + 2):
         read = call("pane", "read", pane_id)
         if read.returncode:
             return cleared
-        gate = match_startup_gate(read.stdout)
+        gate = match_startup_gate(read.stdout, kind)
         if gate is None:
             return cleared
         for key in gate["keys"]:
@@ -283,7 +345,7 @@ def clear_startup_gates(pane_id):
         after = call("pane", "read", pane_id)
         # ponytail: same gate still on screen means our key sequence no longer
         # fits this CLI version; stop instead of trying other keys.
-        if after.returncode or match_startup_gate(after.stdout) is gate:
+        if after.returncode or match_startup_gate(after.stdout, kind) is gate:
             return cleared
         cleared += 1
     return cleared
@@ -376,14 +438,15 @@ def emit(status, pane_id, agent_name, wait_mode, text, receipt, receipt_baseline
     raise SystemExit(0 if output["ok"] else 2)
 
 
-def submit(target, prompt, timeout, lines, baseline_revision, receipt=None):
+def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind=None):
     receipt_baseline = receipt_snapshot(receipt) if receipt else None
     started_ns = time.time_ns()
     before = call("agent", "read", target, "--source", "visible")
     if before.returncode:
         fail("agent_preflight_read_failed", detail=payload(before))
-    if requires_manual_setup(before.stdout):
-        fail("agent_requires_manual_setup", target=target)
+    reason = gate_blocking_reason(before.stdout, kind)
+    if reason:
+        fail("agent_requires_manual_setup", target=target, reason=reason)
     result = call("agent", "prompt", target, prompt, "--wait", "--timeout", str(timeout))
     if result.returncode:
         state = call("agent", "get", target)
@@ -513,14 +576,15 @@ def start_agent(kind, name, timeout):
         # failed start, so wait for readiness here rather than starting again.
         # Only known gates are answered; an unrecognized one leaves `started`
         # failed and falls through below.
-        if clear_startup_gates(pane_id):
+        if clear_startup_gates(pane_id, kind):
             started = call("agent", "wait", name, "--until", "idle", "--timeout", start_timeout)
     if started.returncode:
         screen = call("pane", "read", pane_id)
-        gated = screen.returncode == 0 and requires_manual_setup(screen.stdout)
+        reason = gate_blocking_reason(screen.stdout, kind) if screen.returncode == 0 else None
         call("pane", "close", pane_id)
-        if gated:
-            fail("agent_requires_manual_setup", pane_id=pane_id, detail=payload(started))
+        if reason:
+            fail("agent_requires_manual_setup", pane_id=pane_id, reason=reason,
+                 detail=payload(started))
         fail("agent_start_failed", pane_id=pane_id, detail=payload(started))
     agent = payload(started).get("result", {}).get("agent", {})
     return pane_id, agent.get("revision", 0)
@@ -587,8 +651,9 @@ def main():
         # ponytail: answer the known pre-composer gates before the prompt is typed,
         # so a trust dialog never swallows it. Runs only here, at startup -- never
         # around a prompt the worker is already handling.
-        clear_startup_gates(pane_id)
-        submit(name, args.prompt, args.timeout, args.lines, revision, args.receipt)
+        clear_startup_gates(pane_id, args.kind)
+        submit(name, args.prompt, args.timeout, args.lines, revision, args.receipt,
+               kind=args.kind)
 
     state = call("agent", "get", args.target)
     if state.returncode:
