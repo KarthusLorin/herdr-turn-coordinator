@@ -18,6 +18,8 @@ CLI_PATH = Path.home() / ".local" / "bin" / "herdr-turn"
 # revision-quiet detector below.
 DEFAULT_TURN_TIMEOUT_MS = 1_800_000
 SETTLED_STABILITY_MS = 1_500
+# ponytail: a TUI needs a moment to repaint between keys of a gate sequence.
+GATE_KEY_SETTLE_S = 0.4
 
 # A settled pane only proves the TUI returned to its prompt box: a worker that
 # hit a rate limit, ran out of context, or gave up mid-task settles exactly like
@@ -199,11 +201,92 @@ def contains_new_prompt(before, after, prompt):
     return False
 
 
+# ponytail: startup gates that appear before the composer and whose answer is
+# task-independent. Each entry is matched by BOTH its confirm label and a second
+# distinctive marker, so an unrelated dialog cannot match by accident. Labels and
+# key sequences below were captured from a live Claude Code 2.1.258 pane in an
+# untrusted git root; re-capture them before widening this table. Every one of
+# these dialogs defaults its focus to the refusing option, so the sequence must
+# move the selection before confirming -- never send a bare Enter.
+STARTUP_GATES = (
+    {
+        "confirm": "yes, i trust this folder",
+        "marker": "accessing workspace",
+        "keys": ("Down", "Enter"),
+    },
+    {
+        "confirm": "yes, allow external imports",
+        "marker": "external imports:",
+        "keys": ("Down", "Enter"),
+    },
+)
+
+
+def normalize_gate_screen(text):
+    return " ".join(text.lower().split())
+
+
+def match_startup_gate(text):
+    screen = normalize_gate_screen(text)
+    for gate in STARTUP_GATES:
+        if gate["confirm"] in screen and gate["marker"] in screen:
+            return gate
+    return None
+
+
+# Startup gates we can recognize but will NOT answer, because no key sequence has
+# been verified for them. Naming them buys a fast, legible failure instead of a
+# prompt typed into a dialog or a silent wait until the turn's timeout.
+UNANSWERED_GATE_MARKERS = (
+    "trust this folder?",          # kimi's wording; its key layout is unverified
+    "don't trust",
+    "enable project mcp servers",
+    "hooks need review",
+    "press t to trust",
+    "modified since last trusted",
+)
+
+
 def requires_manual_setup(text):
-    text = " ".join(text.lower().split())
-    return "trust this folder?" in text and (
-        "don't trust" in text or "enable project mcp servers" in text
-    )
+    """True when the pane sits on a gate this coordinator will not answer itself."""
+    screen = normalize_gate_screen(text)
+    if match_startup_gate(text):
+        return False
+    if any(marker in screen for marker in UNANSWERED_GATE_MARKERS):
+        return True
+    # An unrecognized confirmation prompt: refuse rather than guess a key.
+    return "enter to confirm" in screen and "esc to cancel" in screen
+
+
+def clear_startup_gates(pane_id):
+    """Answer known pre-composer gates in a pane, verifying each one cleared.
+
+    Reads the pane rather than the agent: these gates block startup before the
+    agent is registered, so `agent read` is not available yet. Bounded,
+    closed-loop, and fail-closed -- only gates in STARTUP_GATES are answered,
+    each answer is verified by re-reading the screen, and anything unrecognized
+    is left untouched for the caller to report. Returns how many it cleared.
+    """
+    cleared = 0
+    for _ in range(len(STARTUP_GATES) + 2):
+        read = call("pane", "read", pane_id)
+        if read.returncode:
+            return cleared
+        gate = match_startup_gate(read.stdout)
+        if gate is None:
+            return cleared
+        for key in gate["keys"]:
+            sent = call("pane", "send-keys", pane_id, key)
+            if sent.returncode:
+                return cleared
+            time.sleep(GATE_KEY_SETTLE_S)
+        after = call("pane", "read", pane_id)
+        # ponytail: same gate still on screen means our key sequence no longer
+        # fits this CLI version; stop instead of trying other keys.
+        if after.returncode or match_startup_gate(after.stdout) is gate:
+            return cleared
+        cleared += 1
+    return cleared
 
 
 def confirm_stable_settled(target, info, deadline):
@@ -386,6 +469,19 @@ def choose_split(layout, caller_pane_id):
     return None, "right" if area["width"] >= area["height"] * 2 else "down"
 
 
+# ponytail: hook-trust prompts block startup before the composer appears; codex and
+# traecli expose an official bypass flag for exactly this. Claude Code has no
+# equivalent, so it is deliberately absent here.
+STARTUP_AGENT_ARGS = {
+    "codex": ("--dangerously-bypass-hook-trust",),
+    "traecli": ("--dangerously-bypass-hook-trust",),
+}
+
+
+def startup_agent_args(kind):
+    return STARTUP_AGENT_ARGS.get(kind, ())
+
+
 def start_agent(kind, name, timeout):
     layout = call("pane", "layout", "--pane", os.environ["HERDR_PANE_ID"])
     if layout.returncode:
@@ -401,15 +497,30 @@ def start_agent(kind, name, timeout):
     pane_id = payload(split)["result"]["pane"]["pane_id"]
 
     start_timeout = str(min(max(timeout, 3001), 300000))
-    started = call("agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", start_timeout)
+    extra = startup_agent_args(kind)
+    passthrough = ("--", *extra) if extra else ()
+    started = call("agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", start_timeout, *passthrough)
     if started.returncode and payload(started).get("error", {}).get("code") == "agent_pane_busy":
         process = call("pane", "process-info", "--pane", pane_id)
         # ponytail: one bounded retry covers shell startup; use a shell-ready event if Herdr adds one.
         if process.returncode == 0:
             time.sleep(0.2)
-            started = call("agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", start_timeout)
+            started = call("agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", start_timeout, *passthrough)
+    if started.returncode and payload(started).get("error", {}).get("code") == "agent_not_ready":
+        # ponytail: a startup gate blocks registration itself, so this is the only
+        # place the pane can still be rescued -- after `agent start` gave up but
+        # before the pane is torn down. The name is already registered by the
+        # failed start, so wait for readiness here rather than starting again.
+        # Only known gates are answered; an unrecognized one leaves `started`
+        # failed and falls through below.
+        if clear_startup_gates(pane_id):
+            started = call("agent", "wait", name, "--until", "idle", "--timeout", start_timeout)
     if started.returncode:
+        screen = call("pane", "read", pane_id)
+        gated = screen.returncode == 0 and requires_manual_setup(screen.stdout)
         call("pane", "close", pane_id)
+        if gated:
+            fail("agent_requires_manual_setup", pane_id=pane_id, detail=payload(started))
         fail("agent_start_failed", pane_id=pane_id, detail=payload(started))
     agent = payload(started).get("result", {}).get("agent", {})
     return pane_id, agent.get("revision", 0)
@@ -472,7 +583,11 @@ def main():
 
     if args.command == "run":
         name = args.name or f"{args.kind}turn_{os.getpid()}"
-        _, revision = start_agent(args.kind, name, args.timeout)
+        pane_id, revision = start_agent(args.kind, name, args.timeout)
+        # ponytail: answer the known pre-composer gates before the prompt is typed,
+        # so a trust dialog never swallows it. Runs only here, at startup -- never
+        # around a prompt the worker is already handling.
+        clear_startup_gates(pane_id)
         submit(name, args.prompt, args.timeout, args.lines, revision, args.receipt)
 
     state = call("agent", "get", args.target)

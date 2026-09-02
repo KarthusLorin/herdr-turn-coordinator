@@ -12,12 +12,15 @@ from unittest.mock import patch
 
 from herdr_turn import (
     choose_split,
+    clear_startup_gates,
     contains_new_prompt,
     emit,
+    match_startup_gate,
     parse_timeout,
     receipt_arg,
     receipt_snapshot,
     requires_manual_setup,
+    startup_agent_args,
     submit,
     verify_receipt,
     wait_for_quiet,
@@ -354,3 +357,95 @@ class ReceiptEmitTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["receipt"]["accepted"])
         self.assertEqual(code, 0)
+
+
+class StartupGateMatchTest(unittest.TestCase):
+    def test_matches_the_claude_directory_trust_dialog(self):
+        screen = (
+            " Accessing workspace:\n"
+            " /Users/x/Code/repo\n"
+            " Quick safety check: Is this a project you created or one you trust?\n"
+            " No, exit\n"
+            " Yes, I trust this folder\n"
+            " Enter to confirm - Esc to cancel"
+        )
+        gate = match_startup_gate(screen)
+        self.assertIsNotNone(gate)
+        self.assertEqual(gate["keys"], ("Down", "Enter"))
+
+    def test_matches_the_claude_external_imports_dialog(self):
+        screen = (
+            " This project's CLAUDE.md imports files outside the current working directory.\n"
+            " External imports:\n"
+            "   /Users/x/Code/AGENTS.md\n"
+            " No, disable external imports\n"
+            " Yes, allow external imports\n"
+            " Enter to confirm - Esc to cancel"
+        )
+        self.assertIsNotNone(match_startup_gate(screen))
+
+    def test_does_not_match_a_working_composer(self):
+        self.assertIsNone(match_startup_gate("Ask anything\n? for shortcuts"))
+
+    def test_needs_both_the_confirm_label_and_its_marker(self):
+        # The label alone -- e.g. quoted in a worker's own report -- must not match.
+        self.assertIsNone(match_startup_gate("the pane asked: Yes, I trust this folder"))
+
+
+class ManualSetupTest(unittest.TestCase):
+    def test_an_answerable_gate_is_not_manual_setup(self):
+        screen = "Accessing workspace: /repo\nNo, exit\nYes, I trust this folder"
+        self.assertFalse(requires_manual_setup(screen))
+
+    def test_a_hook_review_panel_needs_a_human(self):
+        self.assertTrue(requires_manual_setup("2 hooks need review\nPress t to trust all"))
+
+    def test_an_unknown_confirmation_prompt_needs_a_human(self):
+        screen = "Sign in to continue\nEnter to confirm - Esc to cancel"
+        self.assertTrue(requires_manual_setup(screen))
+
+
+class ClearStartupGatesTest(unittest.TestCase):
+    def screens(self, *texts):
+        return [subprocess.CompletedProcess([], 0, stdout=t, stderr="") for t in texts]
+
+    def test_clears_a_known_gate_and_verifies_it_went_away(self):
+        trust = "Accessing workspace: /repo\nNo, exit\nYes, I trust this folder"
+        composer = "Ask anything"
+        results = self.screens(trust) + [
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),  # Down
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),  # Enter
+        ] + self.screens(composer, composer)
+        with patch("herdr_turn.call", side_effect=results) as call:
+            with patch("herdr_turn.time.sleep"):
+                self.assertEqual(clear_startup_gates("w1:p1"), 1)
+        keys = [c.args[3] for c in call.call_args_list if c.args[1] == "send-keys"]
+        self.assertEqual(keys, ["Down", "Enter"])
+
+    def test_sends_no_keys_at_an_unrecognized_gate(self):
+        screen = "Sign in with your account\nEnter to confirm - Esc to cancel"
+        with patch("herdr_turn.call", side_effect=self.screens(screen)) as call:
+            self.assertEqual(clear_startup_gates("w1:p1"), 0)
+        self.assertEqual([c for c in call.call_args_list if c.args[1] == "send-keys"], [])
+
+    def test_gives_up_after_one_attempt_when_the_gate_stays(self):
+        trust = "Accessing workspace: /repo\nNo, exit\nYes, I trust this folder"
+        results = self.screens(trust) + [
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+        ] + self.screens(trust)
+        with patch("herdr_turn.call", side_effect=results) as call:
+            with patch("herdr_turn.time.sleep"):
+                self.assertEqual(clear_startup_gates("w1:p1"), 0)
+        keys = [c.args[3] for c in call.call_args_list if c.args[1] == "send-keys"]
+        self.assertEqual(keys, ["Down", "Enter"])
+
+
+class StartupAgentArgsTest(unittest.TestCase):
+    def test_passes_the_official_bypass_to_the_clis_that_have_it(self):
+        self.assertEqual(startup_agent_args("codex"), ("--dangerously-bypass-hook-trust",))
+        self.assertEqual(startup_agent_args("traecli"), ("--dangerously-bypass-hook-trust",))
+
+    def test_passes_nothing_to_a_cli_without_that_flag(self):
+        self.assertEqual(startup_agent_args("claude"), ())
+        self.assertEqual(startup_agent_args("kimi"), ())
