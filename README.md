@@ -94,6 +94,48 @@ Both commands block until the turn settles or the timeout expires, then print on
 
 On `ok: false`, a non-zero exit, or a status other than `idle`/`done`, stop for human takeover instead of polling Herdr from model turns.
 
+### Completion receipts
+
+A settled pane only proves the TUI returned to its prompt box. A worker that hit
+a rate limit, ran out of context, or gave up mid-task settles exactly like one
+that finished, so `agent_status` alone cannot separate them. Pass `--receipt`
+with an absolute path to require the worker to write a JSON receipt as its final
+action:
+
+```sh
+herdr-turn run \
+  --kind codex \
+  --name reviewer \
+  --receipt /abs/path/run-1/receipt.json \
+  --prompt "Review the diff, write findings to /abs/path/run-1/review.md, then write
+{\"status\":\"completed\",\"artifacts\":[\"/abs/path/run-1/review.md\"],\"remaining\":[],\"reason\":\"done\"}
+to /abs/path/run-1/receipt.json as your final action."
+```
+
+The wrapper verifies the receipt itself and adds a `receipt` object to the
+result:
+
+```json
+{
+  "ok": false,
+  "agent_status": "done",
+  "receipt": {"path": "...", "present": false, "fresh": false, "parsable": false,
+              "accepted": false, "problem": "missing"}
+}
+```
+
+`problem` is one of `missing`, `stale`, `unparsable`, `not_completed`, or
+`artifact_unverified`. A receipt is accepted only when it appeared during this
+turn, parses as a JSON object, reports `status: "completed"`, and every path in
+`artifacts` exists and was modified during the turn. A receipt left behind by an
+earlier attempt is rejected as `stale`, so reusing a receipt path across retries
+cannot produce a false success. An empty `artifacts` list is legitimate for
+investigation or review turns that deliver only the receipt.
+
+`--receipt` is opt-in. Without it the result keeps its published shape and `ok`
+keeps its previous meaning; with it, `ok` additionally requires an accepted
+receipt.
+
 ## Suggested agent instruction
 
 ```md
@@ -112,6 +154,7 @@ then consume its single final JSON result. Do not poll Herdr from model turns.
 - Uses native lifecycle waiting once Herdr reports `working`; otherwise a local 60-second revision-quiet heuristic returns `unknown` without declaring success.
 - Reads history once only after confirmed completion. Blocked or uncertain turns read the visible screen without scrolling the live TUI.
 - Never resends a stalled prompt automatically.
+- With `--receipt`, verifies the receipt after the pane settles and folds the verdict into `ok`; without it, behavior is unchanged.
 
 ## Local A/B result
 

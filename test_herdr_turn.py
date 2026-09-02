@@ -3,16 +3,23 @@ import io
 import json
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 from herdr_turn import (
     choose_split,
     contains_new_prompt,
+    emit,
     parse_timeout,
+    receipt_arg,
+    receipt_snapshot,
     requires_manual_setup,
     submit,
+    verify_receipt,
     wait_for_quiet,
 )
 
@@ -227,3 +234,123 @@ class PromptDetectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReceiptVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+        self.receipt = self.root / "receipt.json"
+
+    def write(self, path, payload):
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_accepts_a_fresh_completed_receipt_with_no_artifacts(self):
+        started = time.time_ns()
+        self.write(self.receipt, {"status": "completed", "artifacts": []})
+        report = verify_receipt(self.receipt, None, started)
+        self.assertTrue(report["accepted"])
+        self.assertTrue(report["parsable"])
+
+    def test_reports_a_missing_receipt_rather_than_accepting_a_quiet_pane(self):
+        report = verify_receipt(self.receipt, None, time.time_ns())
+        self.assertFalse(report["accepted"])
+        self.assertFalse(report["present"])
+        self.assertEqual(report["problem"], "missing")
+
+    def test_rejects_a_receipt_left_over_from_an_earlier_attempt(self):
+        self.write(self.receipt, {"status": "completed", "artifacts": []})
+        baseline = receipt_snapshot(self.receipt)
+        started = time.time_ns()
+        report = verify_receipt(self.receipt, baseline, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "stale")
+
+    def test_rejects_an_unparsable_receipt(self):
+        started = time.time_ns()
+        self.receipt.write_text("{not json", encoding="utf-8")
+        report = verify_receipt(self.receipt, None, started)
+        self.assertTrue(report["present"])
+        self.assertFalse(report["parsable"])
+        self.assertEqual(report["problem"], "unparsable")
+
+    def test_rejects_a_completed_receipt_naming_an_absent_artifact(self):
+        started = time.time_ns()
+        self.write(self.receipt, {
+            "status": "completed",
+            "artifacts": [str(self.root / "never-written.md")],
+        })
+        report = verify_receipt(self.receipt, None, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "artifact_unverified")
+
+    def test_rejects_an_artifact_that_predates_this_turn(self):
+        stale_artifact = self.root / "old.md"
+        stale_artifact.write_text("written earlier", encoding="utf-8")
+        started = time.time_ns()
+        self.write(self.receipt, {
+            "status": "completed",
+            "artifacts": [str(stale_artifact)],
+        })
+        report = verify_receipt(self.receipt, None, started)
+        self.assertFalse(report["accepted"])
+        self.assertFalse(report["artifacts"][0]["fresh"])
+        self.assertEqual(report["problem"], "artifact_unverified")
+
+    def test_keeps_a_partial_receipt_out_of_acceptance_but_reports_remaining(self):
+        started = time.time_ns()
+        self.write(self.receipt, {
+            "status": "partial",
+            "artifacts": [],
+            "remaining": ["section 3"],
+        })
+        report = verify_receipt(self.receipt, None, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "not_completed")
+        self.assertEqual(report["remaining"], ["section 3"])
+
+    def test_requires_an_absolute_receipt_path(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            receipt_arg("relative/receipt.json")
+        self.assertEqual(receipt_arg("/tmp/r.json"), Path("/tmp/r.json"))
+
+
+class ReceiptEmitTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.receipt = Path(self.dir.name) / "receipt.json"
+
+    def emit_once(self, status, receipt, started_ns=None):
+        buffer = io.StringIO()
+        started = time.time_ns() if started_ns is None else started_ns
+        with self.assertRaises(SystemExit) as exit_info, redirect_stdout(buffer):
+            emit(status, "p1", "worker", "native_wait", "text",
+                 receipt, None, started)
+        return json.loads(buffer.getvalue()), exit_info.exception.code
+
+    def test_omits_the_receipt_field_when_the_caller_did_not_ask_for_one(self):
+        payload, code = self.emit_once("idle", None)
+        self.assertNotIn("receipt", payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(code, 0)
+
+    def test_a_settled_pane_without_its_receipt_is_not_ok(self):
+        payload, code = self.emit_once("idle", self.receipt)
+        self.assertTrue(payload["agent_status"] == "idle")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["receipt"]["problem"], "missing")
+        self.assertEqual(code, 2)
+
+    def test_a_settled_pane_with_a_verified_receipt_is_ok(self):
+        # The turn starts, then the worker writes its receipt: the order the
+        # wrapper actually sees.
+        started = time.time_ns()
+        self.receipt.write_text(
+            json.dumps({"status": "completed", "artifacts": []}), encoding="utf-8"
+        )
+        payload, code = self.emit_once("done", self.receipt, started)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["receipt"]["accepted"])
+        self.assertEqual(code, 0)
