@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import time
+from collections import namedtuple
 from pathlib import Path
 
 
@@ -26,6 +27,12 @@ GATE_KEY_SETTLE_S = 0.4
 # one that finished. `--receipt` opts a caller into the stronger contract, where
 # the worker's final act is writing a JSON receipt the wrapper verifies itself.
 RECEIPT_TERMINAL_STATUS = "completed"
+RECEIPT_STATUSES = {RECEIPT_TERMINAL_STATUS, "partial", "blocked"}
+
+# What the dispatcher decided this turn owes, snapshotted just before the prompt
+# goes out. `expected` is the deliverable list the dispatcher named; an empty one
+# means it explicitly declared the turn owes only its receipt.
+ReceiptPlan = namedtuple("ReceiptPlan", "path baseline expected started_ns")
 
 
 def call(*args):
@@ -42,8 +49,17 @@ def payload(result):
         return {"raw": raw, "exit_code": result.returncode}
 
 
-def fail(message, **details):
-    print(json.dumps({"ok": False, "error": message, **details}, ensure_ascii=False))
+def timed_out_code(detail):
+    """Herdr reports its own waiting ceiling as error code `timeout`. Any failure
+    carrying it means the worker was cut off, not that it gave up."""
+    return isinstance(detail, dict) and detail.get("error", {}).get("code") == "timeout"
+
+
+def fail(message, *, timed_out=False, **details):
+    print(json.dumps(
+        {"ok": False, "error": message, "timed_out": timed_out, **details},
+        ensure_ascii=False,
+    ))
     raise SystemExit(1)
 
 
@@ -100,11 +116,22 @@ def receipt_snapshot(path):
     return [stat.st_mtime_ns, stat.st_size, stat.st_ino]
 
 
-def check_artifacts(entries, started_ns):
+def normalize_artifact(entry):
+    """Compare artifact paths the way the filesystem sees them: the dispatcher
+    writes `/tmp/run/x`, the worker may report `/private/tmp/run/x`, and both
+    name the same deliverable."""
+    return os.path.realpath(entry)
+
+
+def check_artifacts(entries, expected, started_ns):
     checked = []
+    seen = set()
     for entry in entries:
         item = {"path": entry, "exists": False, "fresh": False}
         if isinstance(entry, str) and entry:
+            resolved = normalize_artifact(entry)
+            seen.add(resolved)
+            item["expected"] = resolved in expected
             try:
                 stat = Path(entry).stat()
             except OSError:
@@ -113,16 +140,41 @@ def check_artifacts(entries, started_ns):
                 item["exists"] = True
                 item["fresh"] = stat.st_mtime_ns >= started_ns
         checked.append(item)
-    return checked
+    # A deliverable the dispatcher named and the worker never mentioned is the
+    # failure this contract exists for: the worker's own list can no longer
+    # decide that nothing was owed.
+    undeclared = [path for path in expected if path not in seen]
+    return checked, undeclared
 
 
-def verify_receipt(path, baseline, started_ns):
+def check_consistency(data, status):
+    """Syntax-level contradictions inside a receipt. A worker that claims
+    `completed` while listing unfinished work, or reports a stop without saying
+    why, has produced a receipt no recovery step can act on."""
+    if status not in RECEIPT_STATUSES:
+        return f"status must be one of {sorted(RECEIPT_STATUSES)}, got {status!r}"
+    remaining = data.get("remaining")
+    if remaining is not None and not isinstance(remaining, list):
+        return "remaining must be a list"
+    if status == RECEIPT_TERMINAL_STATUS:
+        if remaining:
+            return "completed receipt still lists remaining work"
+    else:
+        reason = data.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return f"{status} receipt must give a reason"
+    return None
+
+
+def verify_receipt(path, baseline, expected, started_ns):
+    expected = {normalize_artifact(item) for item in expected}
     report = {
         "path": str(path),
         "present": False,
         "fresh": False,
         "parsable": False,
         "accepted": False,
+        "expected_artifacts": sorted(expected),
     }
     current = receipt_snapshot(path)
     if current is None:
@@ -148,15 +200,22 @@ def verify_receipt(path, baseline, started_ns):
     report["remaining"] = data.get("remaining")
     report["reason"] = data.get("reason")
     entries = data.get("artifacts")
-    report["artifacts"] = check_artifacts(
-        entries if isinstance(entries, list) else [], started_ns
+    report["artifacts"], undeclared = check_artifacts(
+        entries if isinstance(entries, list) else [], expected, started_ns
     )
-    # An empty artifact list is legitimate: an investigation or review turn may
-    # deliver only the receipt. What is never legitimate is a named artifact
-    # that is absent or untouched by this turn.
-    artifacts_ok = all(item["exists"] and item["fresh"] for item in report["artifacts"])
+    report["missing_expected"] = undeclared
+    artifacts_ok = not undeclared and all(
+        item["exists"] and item["fresh"] for item in report["artifacts"]
+    )
     report["artifacts_ok"] = artifacts_ok
-    if report["status"] != RECEIPT_TERMINAL_STATUS:
+
+    # Ordered so the problem names the cheapest recovery: a self-contradictory
+    # receipt has to be rewritten before its `remaining` can be trusted.
+    contradiction = check_consistency(data, report["status"])
+    if contradiction is not None:
+        report["problem"] = "inconsistent"
+        report["detail"] = contradiction
+    elif report["status"] != RECEIPT_TERMINAL_STATUS:
         report["problem"] = "not_completed"
     elif not artifacts_ok:
         report["problem"] = "artifact_unverified"
@@ -355,7 +414,7 @@ def confirm_stable_settled(target, info, deadline):
     while info.get("agent_status") in {"idle", "done"}:
         remaining = int((deadline - time.monotonic()) * 1000)
         if remaining <= 0:
-            fail("agent_settled_confirmation_timeout", target=target)
+            fail("agent_settled_confirmation_timeout", timed_out=True, target=target)
         grace = min(SETTLED_STABILITY_MS, remaining)
         resumed = call(
             "agent", "wait", target,
@@ -374,10 +433,11 @@ def confirm_stable_settled(target, info, deadline):
 
         remaining = int((deadline - time.monotonic()) * 1000)
         if remaining <= 0:
-            fail("agent_settled_confirmation_timeout", target=target)
+            fail("agent_settled_confirmation_timeout", timed_out=True, target=target)
         settled = call("agent", "wait", target, "--timeout", str(remaining))
         if settled.returncode:
-            fail("agent_wait_failed", detail=payload(settled))
+            detail = payload(settled)
+            fail("agent_wait_failed", timed_out=timed_out_code(detail), detail=detail)
         info = payload(settled).get("result", {}).get("agent", {})
 
     return info, "blocked" if info.get("agent_status") == "blocked" else "native_wait"
@@ -401,7 +461,8 @@ def wait_for_quiet(target, pane_id, delivered_revision, timeout):
             remaining = max(int((deadline - time.monotonic()) * 1000), 3001)
             settled = call("agent", "wait", target, "--timeout", str(remaining))
             if settled.returncode:
-                fail("agent_wait_failed", detail=payload(settled))
+                detail = payload(settled)
+                fail("agent_wait_failed", timed_out=timed_out_code(detail), detail=detail)
             info = payload(settled).get("result", {}).get("agent", {})
             if info.get("agent_status") in {"idle", "done"}:
                 info, wait_mode = confirm_stable_settled(target, info, deadline)
@@ -414,10 +475,10 @@ def wait_for_quiet(target, pane_id, delivered_revision, timeout):
         if time.monotonic() - last_change >= 60:
             return "unknown", "output_quiet"
         time.sleep(0.5)
-    fail("agent_quiet_timeout", pane_id=pane_id, revision=revision)
+    fail("agent_quiet_timeout", timed_out=True, pane_id=pane_id, revision=revision)
 
 
-def emit(status, pane_id, agent_name, wait_mode, text, receipt, receipt_baseline, started_ns):
+def emit(status, pane_id, agent_name, wait_mode, text, plan):
     settled = status in {"idle", "done"}
     output = {
         "ok": settled,
@@ -425,10 +486,15 @@ def emit(status, pane_id, agent_name, wait_mode, text, receipt, receipt_baseline
         "agent_name": agent_name,
         "agent_status": status,
         "wait_mode": wait_mode,
+        # A turn that reached this point observed the pane settle within budget.
+        # Only the ceiling paths report `timed_out: true`, which is what tells a
+        # supervisor whether a missing receipt means "gave up" or "may still be
+        # running" -- the two need opposite recoveries.
+        "timed_out": False,
         "text": text,
     }
-    if receipt is not None:
-        report = verify_receipt(receipt, receipt_baseline, started_ns)
+    if plan is not None:
+        report = verify_receipt(plan.path, plan.baseline, plan.expected, plan.started_ns)
         output["receipt"] = report
         # Only a caller that asked for a receipt gets the stronger `ok`. Without
         # `--receipt` the payload keeps its published meaning, so older
@@ -438,9 +504,16 @@ def emit(status, pane_id, agent_name, wait_mode, text, receipt, receipt_baseline
     raise SystemExit(0 if output["ok"] else 2)
 
 
-def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind=None):
-    receipt_baseline = receipt_snapshot(receipt) if receipt else None
-    started_ns = time.time_ns()
+def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind=None,
+           expected=()):
+    plan = None
+    if receipt is not None:
+        plan = ReceiptPlan(
+            path=receipt,
+            baseline=receipt_snapshot(receipt),
+            expected=set(expected),
+            started_ns=time.time_ns(),
+        )
     before = call("agent", "read", target, "--source", "visible")
     if before.returncode:
         fail("agent_preflight_read_failed", detail=payload(before))
@@ -482,7 +555,7 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
             final_text = read_once(target, lines) if wait_mode == "native_wait" and status in {"idle", "done"} else read_visible(target)
             emit(
                 status, agent["pane_id"], agent.get("name"), wait_mode, final_text,
-                receipt, receipt_baseline, started_ns,
+                plan,
             )
         fail(
             "agent_prompt_failed",
@@ -502,7 +575,7 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
     text = read_once(target, lines) if status in {"idle", "done"} else read_visible(target)
     emit(
         status, info.get("pane_id"), info.get("name"), wait_mode, text,
-        receipt, receipt_baseline, started_ns,
+        plan,
     )
 
 
@@ -604,6 +677,8 @@ def main():
     )
     run.add_argument("--lines", type=int, default=160)
     run.add_argument("--receipt", type=receipt_arg, metavar="PATH", help="absolute path to the JSON receipt the worker must write as its final action; enables receipt verification and folds it into `ok`")
+    run.add_argument("--expect-artifact", type=receipt_arg, action="append", default=[], metavar="PATH", dest="expect_artifact", help="absolute path to a deliverable this turn owes (repeatable); a receipt that omits it is rejected")
+    run.add_argument("--no-artifacts", action="store_true", help="declare that this turn owes only its receipt; required with --receipt when no --expect-artifact is given")
 
     prompt = sub.add_parser("prompt")
     prompt.add_argument("--target", required=True)
@@ -614,11 +689,28 @@ def main():
     )
     prompt.add_argument("--lines", type=int, default=160)
     prompt.add_argument("--receipt", type=receipt_arg, metavar="PATH", help="absolute path to the JSON receipt the worker must write as its final action; enables receipt verification and folds it into `ok`")
+    prompt.add_argument("--expect-artifact", type=receipt_arg, action="append", default=[], metavar="PATH", dest="expect_artifact", help="absolute path to a deliverable this turn owes (repeatable); a receipt that omits it is rejected")
+    prompt.add_argument("--no-artifacts", action="store_true", help="declare that this turn owes only its receipt; required with --receipt when no --expect-artifact is given")
 
     sub.add_parser("doctor")
     sub.add_parser("install-cli")
     sub.add_parser("uninstall-cli")
     args = parser.parse_args()
+
+    if args.command in {"run", "prompt"}:
+        # Whether a turn owes files is the dispatcher's call, made before the
+        # work starts. Leaving it to the worker's own artifact list is how a
+        # turn that produced nothing gets accepted.
+        if args.expect_artifact and args.no_artifacts:
+            parser.error("--no-artifacts cannot be combined with --expect-artifact")
+        if args.receipt is None and (args.expect_artifact or args.no_artifacts):
+            parser.error("--expect-artifact and --no-artifacts require --receipt")
+        if args.receipt is not None and not args.expect_artifact and not args.no_artifacts:
+            parser.error(
+                "--receipt requires either --expect-artifact PATH or --no-artifacts"
+            )
+        if args.receipt is not None and args.receipt in args.expect_artifact:
+            parser.error("the receipt cannot also be one of its own expected artifacts")
 
     if args.command == "install-cli":
         install_cli()
@@ -653,7 +745,7 @@ def main():
         # around a prompt the worker is already handling.
         clear_startup_gates(pane_id, args.kind)
         submit(name, args.prompt, args.timeout, args.lines, revision, args.receipt,
-               kind=args.kind)
+               kind=args.kind, expected=args.expect_artifact)
 
     state = call("agent", "get", args.target)
     if state.returncode:
@@ -661,7 +753,8 @@ def main():
     agent = payload(state).get("result", {}).get("agent", {})
     if agent.get("agent_status") not in {"idle", "done"}:
         fail("agent_not_settled", agent_status=agent.get("agent_status"))
-    submit(args.target, args.prompt, args.timeout, args.lines, agent.get("revision", 0), args.receipt)
+    submit(args.target, args.prompt, args.timeout, args.lines, agent.get("revision", 0),
+           args.receipt, expected=args.expect_artifact)
 
 
 if __name__ == "__main__":

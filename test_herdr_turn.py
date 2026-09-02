@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from herdr_turn import (
+    ReceiptPlan,
     choose_split,
     clear_startup_gates,
     contains_new_prompt,
@@ -250,15 +252,20 @@ class ReceiptVerificationTest(unittest.TestCase):
     def write(self, path, payload):
         path.write_text(json.dumps(payload), encoding="utf-8")
 
+    def verify(self, baseline, started, expected=()):
+        return verify_receipt(
+            self.receipt, baseline, {str(item) for item in expected}, started
+        )
+
     def test_accepts_a_fresh_completed_receipt_with_no_artifacts(self):
         started = time.time_ns()
         self.write(self.receipt, {"status": "completed", "artifacts": []})
-        report = verify_receipt(self.receipt, None, started)
+        report = self.verify(None, started)
         self.assertTrue(report["accepted"])
         self.assertTrue(report["parsable"])
 
     def test_reports_a_missing_receipt_rather_than_accepting_a_quiet_pane(self):
-        report = verify_receipt(self.receipt, None, time.time_ns())
+        report = self.verify(None, time.time_ns())
         self.assertFalse(report["accepted"])
         self.assertFalse(report["present"])
         self.assertEqual(report["problem"], "missing")
@@ -267,14 +274,14 @@ class ReceiptVerificationTest(unittest.TestCase):
         self.write(self.receipt, {"status": "completed", "artifacts": []})
         baseline = receipt_snapshot(self.receipt)
         started = time.time_ns()
-        report = verify_receipt(self.receipt, baseline, started)
+        report = self.verify(baseline, started)
         self.assertFalse(report["accepted"])
         self.assertEqual(report["problem"], "stale")
 
     def test_rejects_an_unparsable_receipt(self):
         started = time.time_ns()
         self.receipt.write_text("{not json", encoding="utf-8")
-        report = verify_receipt(self.receipt, None, started)
+        report = self.verify(None, started)
         self.assertTrue(report["present"])
         self.assertFalse(report["parsable"])
         self.assertEqual(report["problem"], "unparsable")
@@ -285,7 +292,7 @@ class ReceiptVerificationTest(unittest.TestCase):
             "status": "completed",
             "artifacts": [str(self.root / "never-written.md")],
         })
-        report = verify_receipt(self.receipt, None, started)
+        report = self.verify(None, started, [self.root / "never-written.md"])
         self.assertFalse(report["accepted"])
         self.assertEqual(report["problem"], "artifact_unverified")
 
@@ -297,7 +304,7 @@ class ReceiptVerificationTest(unittest.TestCase):
             "status": "completed",
             "artifacts": [str(stale_artifact)],
         })
-        report = verify_receipt(self.receipt, None, started)
+        report = self.verify(None, started, [stale_artifact])
         self.assertFalse(report["accepted"])
         self.assertFalse(report["artifacts"][0]["fresh"])
         self.assertEqual(report["problem"], "artifact_unverified")
@@ -308,11 +315,65 @@ class ReceiptVerificationTest(unittest.TestCase):
             "status": "partial",
             "artifacts": [],
             "remaining": ["section 3"],
+            "reason": "ran out of budget",
         })
-        report = verify_receipt(self.receipt, None, started)
+        report = self.verify(None, started)
         self.assertFalse(report["accepted"])
         self.assertEqual(report["problem"], "not_completed")
         self.assertEqual(report["remaining"], ["section 3"])
+
+    def test_rejects_an_expected_artifact_the_worker_never_reported(self):
+        started = time.time_ns()
+        owed = self.root / "report.md"
+        self.write(self.receipt, {"status": "completed", "artifacts": []})
+        report = self.verify(None, started, [owed])
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "artifact_unverified")
+        self.assertEqual(report["missing_expected"], [os.path.realpath(owed)])
+
+    def test_accepts_an_expected_artifact_written_this_turn(self):
+        started = time.time_ns()
+        owed = self.root / "report.md"
+        owed.write_text("findings", encoding="utf-8")
+        self.write(self.receipt, {"status": "completed", "artifacts": [str(owed)]})
+        report = self.verify(None, started, [owed])
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["missing_expected"], [])
+
+    def test_matches_an_expected_artifact_through_a_symlinked_prefix(self):
+        started = time.time_ns()
+        owed = self.root / "report.md"
+        owed.write_text("findings", encoding="utf-8")
+        link = self.root / "alias"
+        link.symlink_to(self.root, target_is_directory=True)
+        self.write(self.receipt, {
+            "status": "completed", "artifacts": [str(link / "report.md")],
+        })
+        report = self.verify(None, started, [owed])
+        self.assertTrue(report["accepted"])
+
+    def test_rejects_a_completed_receipt_that_still_lists_remaining_work(self):
+        started = time.time_ns()
+        self.write(self.receipt, {
+            "status": "completed", "artifacts": [], "remaining": ["section 3"],
+        })
+        report = self.verify(None, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "inconsistent")
+
+    def test_rejects_a_stopped_receipt_that_gives_no_reason(self):
+        started = time.time_ns()
+        self.write(self.receipt, {"status": "blocked", "artifacts": []})
+        report = self.verify(None, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "inconsistent")
+
+    def test_rejects_a_status_outside_the_schema(self):
+        started = time.time_ns()
+        self.write(self.receipt, {"status": "done", "artifacts": []})
+        report = self.verify(None, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "inconsistent")
 
     def test_requires_an_absolute_receipt_path(self):
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -326,12 +387,15 @@ class ReceiptEmitTest(unittest.TestCase):
         self.addCleanup(self.dir.cleanup)
         self.receipt = Path(self.dir.name) / "receipt.json"
 
-    def emit_once(self, status, receipt, started_ns=None):
+    def emit_once(self, status, receipt, started_ns=None, expected=()):
         buffer = io.StringIO()
         started = time.time_ns() if started_ns is None else started_ns
+        plan = None if receipt is None else ReceiptPlan(
+            path=receipt, baseline=None,
+            expected={str(item) for item in expected}, started_ns=started,
+        )
         with self.assertRaises(SystemExit) as exit_info, redirect_stdout(buffer):
-            emit(status, "p1", "worker", "native_wait", "text",
-                 receipt, None, started)
+            emit(status, "p1", "worker", "native_wait", "text", plan)
         return json.loads(buffer.getvalue()), exit_info.exception.code
 
     def test_omits_the_receipt_field_when_the_caller_did_not_ask_for_one(self):
@@ -358,6 +422,12 @@ class ReceiptEmitTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["receipt"]["accepted"])
         self.assertEqual(code, 0)
+
+    def test_a_settled_turn_reports_it_was_not_cut_off(self):
+        # `timed_out` is what separates a worker that gave up from one the
+        # ceiling cut short; the two need opposite recoveries.
+        payload, _ = self.emit_once("done", None)
+        self.assertFalse(payload["timed_out"])
 
 
 class StartupGateMatchTest(unittest.TestCase):
