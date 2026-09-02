@@ -559,6 +559,7 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
             )
         fail(
             "agent_prompt_failed",
+            timed_out=timed_out_code(prompt_error),
             prompt=prompt_error,
             state=payload(state),
             before=payload(before),
