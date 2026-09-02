@@ -17,6 +17,7 @@ CLI_PATH = Path.home() / ".local" / "bin" / "herdr-turn"
 # covers complex multi-step turns; short hangs still surface via the fallback
 # revision-quiet detector below.
 DEFAULT_TURN_TIMEOUT_MS = 1_800_000
+SETTLED_STABILITY_MS = 1_500
 
 
 def call(*args):
@@ -116,6 +117,38 @@ def requires_manual_setup(text):
     )
 
 
+def confirm_stable_settled(target, info, deadline):
+    while info.get("agent_status") in {"idle", "done"}:
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            fail("agent_settled_confirmation_timeout", target=target)
+        grace = min(SETTLED_STABILITY_MS, remaining)
+        resumed = call(
+            "agent", "wait", target,
+            "--until", "working", "--until", "blocked", "--timeout", str(grace),
+        )
+        if resumed.returncode:
+            if payload(resumed).get("error", {}).get("code") == "timeout":
+                return info, "stable_settled"
+            fail("agent_settled_confirmation_failed", detail=payload(resumed))
+
+        info = payload(resumed).get("result", {}).get("agent", {})
+        if info.get("agent_status") == "blocked":
+            return info, "blocked"
+        if info.get("agent_status") != "working":
+            fail("agent_settled_confirmation_unexpected", detail=payload(resumed))
+
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            fail("agent_settled_confirmation_timeout", target=target)
+        settled = call("agent", "wait", target, "--timeout", str(remaining))
+        if settled.returncode:
+            fail("agent_wait_failed", detail=payload(settled))
+        info = payload(settled).get("result", {}).get("agent", {})
+
+    return info, "blocked" if info.get("agent_status") == "blocked" else "native_wait"
+
+
 def wait_for_quiet(target, pane_id, delivered_revision, timeout):
     deadline = time.monotonic() + max(0, timeout - 5000) / 1000
     revision = delivered_revision
@@ -135,10 +168,11 @@ def wait_for_quiet(target, pane_id, delivered_revision, timeout):
             settled = call("agent", "wait", target, "--timeout", str(remaining))
             if settled.returncode:
                 fail("agent_wait_failed", detail=payload(settled))
-            return (
-                payload(settled).get("result", {}).get("agent", {}).get("agent_status", "idle"),
-                "native_wait",
-            )
+            info = payload(settled).get("result", {}).get("agent", {})
+            if info.get("agent_status") in {"idle", "done"}:
+                info, wait_mode = confirm_stable_settled(target, info, deadline)
+                return info.get("agent_status", "idle"), wait_mode
+            return info.get("agent_status", "idle"), "native_wait"
         current = info.get("revision", revision)
         if current != revision:
             revision = current
@@ -207,12 +241,18 @@ def submit(target, prompt, timeout, lines, baseline_revision):
 
     info = payload(result).get("result", {}).get("agent", {})
     status = info.get("agent_status")
+    wait_mode = "native_wait"
+    if status in {"idle", "done"}:
+        deadline = time.monotonic() + timeout / 1000
+        info, wait_mode = confirm_stable_settled(target, info, deadline)
+        status = info.get("agent_status")
     text = read_once(target, lines) if status in {"idle", "done"} else read_visible(target)
     output = {
         "ok": status in {"idle", "done"},
         "pane_id": info.get("pane_id"),
         "agent_name": info.get("name"),
         "agent_status": status,
+        "wait_mode": wait_mode,
         "text": text,
     }
     print(json.dumps(output, ensure_ascii=False))

@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import subprocess
 import sys
 import unittest
@@ -81,15 +82,59 @@ class TimeoutParsingTest(unittest.TestCase):
         with (
             patch("herdr_turn.call", side_effect=[working, done]) as call,
             patch("herdr_turn.time.monotonic", side_effect=[100, 100, 100.5, 101]),
+            patch(
+                "herdr_turn.confirm_stable_settled",
+                return_value=({"agent_status": "done"}, "stable_settled"),
+            ),
         ):
             self.assertEqual(
                 wait_for_quiet("reviewer", "pane-1", 0, 1800000),
-                ("done", "native_wait"),
+                ("done", "stable_settled"),
             )
         call.assert_called_with("agent", "wait", "reviewer", "--timeout", "1794000")
 
 
 class PromptDetectionTest(unittest.TestCase):
+    def test_does_not_accept_transient_done_before_agent_resumes_working(self):
+        prompt = "Review this change."
+        results = [
+            subprocess.CompletedProcess([], 0, stdout="ready", stderr=""),
+            subprocess.CompletedProcess(
+                [], 0,
+                stdout=(
+                    '{"result":{"agent":{"agent":"kimi","agent_status":"done",'
+                    '"name":"reviewer","pane_id":"pane-1","revision":1}}}'
+                ), stderr="",
+            ),
+            subprocess.CompletedProcess(
+                [], 0,
+                stdout=(
+                    '{"result":{"agent":{"agent":"kimi","agent_status":"working",'
+                    '"name":"reviewer","pane_id":"pane-1","revision":1}}}'
+                ), stderr="",
+            ),
+            subprocess.CompletedProcess(
+                [], 0,
+                stdout=(
+                    '{"result":{"agent":{"agent":"kimi","agent_status":"done",'
+                    '"name":"reviewer","pane_id":"pane-1","revision":1}}}'
+                ), stderr="",
+            ),
+            subprocess.CompletedProcess(
+                [], 1,
+                stdout='{"error":{"code":"timeout"}}', stderr="",
+            ),
+            subprocess.CompletedProcess([], 0, stdout="PASS", stderr=""),
+        ]
+        output = io.StringIO()
+        with patch("herdr_turn.call", side_effect=results), redirect_stdout(output):
+            with self.assertRaisesRegex(SystemExit, "0"):
+                submit("reviewer", prompt, 30000, 40, 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["text"], "PASS")
+        self.assertEqual(result["wait_mode"], "stable_settled")
+
     def test_wrapped_box_prompt(self):
         prompt = "Review this change and report only actionable findings."
         after = "│ Review this change and report only │\n│ actionable findings.               │"
