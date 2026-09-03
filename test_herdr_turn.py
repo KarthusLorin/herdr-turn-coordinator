@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -15,12 +16,14 @@ from herdr_turn import (
     ReceiptPlan,
     choose_split,
     clear_startup_gates,
+    confirm_stable_settled,
     contains_new_prompt,
     emit,
     gate_blocking_reason,
     match_startup_gate,
     parse_timeout,
     receipt_arg,
+    receipt_landed,
     receipt_snapshot,
     requires_manual_setup,
     startup_agent_args,
@@ -206,7 +209,7 @@ class PromptDetectionTest(unittest.TestCase):
             [item for item in call.call_args_list if item.args[-1:] == ("enter",)],
             [unittest.mock.call("agent", "send-keys", "reviewer", "enter")],
         )
-        wait.assert_called_once_with("reviewer", "pane-1", 0, 1800000)
+        wait.assert_called_once_with("reviewer", "pane-1", 0, 1800000, None)
 
     def test_does_not_press_enter_for_another_agent(self):
         prompt = "Review this change and report actionable findings."
@@ -397,6 +400,118 @@ class ReceiptVerificationTest(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             receipt_arg("relative/receipt.json")
         self.assertEqual(receipt_arg("/tmp/r.json"), Path("/tmp/r.json"))
+
+
+class StableSettleTest(unittest.TestCase):
+    """A pane that is still idle right after the prompt landed may be a slow CLI
+    rather than a finished turn. Without a receipt only time can tell them
+    apart; with one, the file itself does."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.receipt = Path(self.dir.name) / "receipt.json"
+
+    def plan(self, started_ns=None):
+        return ReceiptPlan(
+            path=self.receipt, baseline=receipt_snapshot(self.receipt),
+            expected=set(),
+            started_ns=time.time_ns() if started_ns is None else started_ns,
+        )
+
+    def timeout(self):
+        return subprocess.CompletedProcess(
+            [], 1, stdout='{"error":{"code":"timeout"}}', stderr="",
+        )
+
+    def working(self):
+        return subprocess.CompletedProcess(
+            [], 0, stdout='{"result":{"agent":{"agent_status":"working"}}}', stderr="",
+        )
+
+    def settled(self):
+        return subprocess.CompletedProcess(
+            [], 0, stdout='{"result":{"agent":{"agent_status":"done"}}}', stderr="",
+        )
+
+    def run_confirm(self, results, plan):
+        deadline = time.monotonic() + 1800
+        with patch("herdr_turn.call", side_effect=results) as call:
+            info, mode = confirm_stable_settled(
+                "reviewer", {"agent_status": "done"}, deadline, plan,
+            )
+        return info, mode, call
+
+    def test_without_a_receipt_one_quiet_window_ends_the_turn(self):
+        _, mode, call = self.run_confirm([self.timeout()], None)
+        self.assertEqual(mode, "stable_settled")
+        self.assertEqual(call.call_count, 1)
+
+    def test_a_promised_receipt_already_on_disk_ends_the_turn_at_once(self):
+        started = time.time_ns()
+        plan = self.plan(started)
+        self.receipt.write_text('{"status":"completed"}', encoding="utf-8")
+        _, mode, call = self.run_confirm([self.timeout()], plan)
+        self.assertEqual(mode, "stable_settled")
+        self.assertEqual(call.call_count, 1)
+
+    def test_re_arms_the_window_while_a_promised_receipt_is_absent(self):
+        plan = self.plan()
+        results = [
+            self.timeout(), self.timeout(),
+            self.working(), self.settled(), self.timeout(),
+        ]
+        _, mode, call = self.run_confirm(results, plan)
+        # Two quiet windows passed with no receipt, then the CLI picked the turn
+        # up and ran it. Ending on the first window -- the false `stable_settled`
+        # this guard exists to prevent -- would have cost the whole turn.
+        self.assertEqual(mode, "stable_settled")
+        self.assertEqual(call.call_count, 5)
+
+    def test_stops_re_arming_once_the_agent_has_been_seen_working(self):
+        plan = self.plan()
+        results = [self.working(), self.settled(), self.timeout()]
+        _, mode, call = self.run_confirm(results, plan)
+        # The turn ran and ended. A missing receipt now means the worker gave up,
+        # not that it was slow to start, so waiting longer buys nothing.
+        self.assertEqual(mode, "stable_settled")
+        self.assertEqual(call.call_count, 3)
+
+    def test_gives_up_re_arming_once_the_receipt_grace_expires(self):
+        plan = self.plan()
+        clock = iter([0, 0, 0, 0, 31, 31])
+        with (
+            patch("herdr_turn.call", return_value=self.timeout()),
+            patch("herdr_turn.time.monotonic", side_effect=lambda: next(clock)),
+        ):
+            _, mode = confirm_stable_settled(
+                "reviewer", {"agent_status": "done"}, 1800, plan,
+            )
+        self.assertEqual(mode, "stable_settled")
+
+    def test_a_stale_receipt_does_not_end_the_wait_early(self):
+        self.receipt.write_text('{"status":"completed"}', encoding="utf-8")
+        plan = ReceiptPlan(
+            path=self.receipt, baseline=receipt_snapshot(self.receipt),
+            expected=set(), started_ns=time.time_ns(),
+        )
+        self.assertFalse(receipt_landed(plan))
+
+
+class PackagingTest(unittest.TestCase):
+    def test_the_npm_and_plugin_versions_agree(self):
+        # One artifact, two version fields: `package.json` names the npm release
+        # and `herdr-plugin.toml` is what `herdr plugin list` shows. They drifted
+        # three minors apart once because a feature commit bumped only one.
+        root = Path(__file__).resolve().parent
+        npm = json.loads((root / "package.json").read_text(encoding="utf-8"))["version"]
+        toml = re.search(
+            r'^version\s*=\s*"([^"]+)"',
+            (root / "herdr-plugin.toml").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(toml, "herdr-plugin.toml declares no version")
+        self.assertEqual(npm, toml.group(1))
 
 
 class ReceiptEmitTest(unittest.TestCase):

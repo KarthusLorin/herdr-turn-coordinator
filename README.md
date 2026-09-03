@@ -137,6 +137,15 @@ say why it stopped has produced nothing a recovery step can act on, whatever its
 success. An empty `artifacts` list is legitimate for investigation or review
 turns that deliver only the receipt.
 
+`--receipt` also makes the wrapper patient about a slow start. A pane that is
+still idle right after the prompt lands is ambiguous — the CLI may not have
+picked the turn up yet — and without a receipt the only tiebreak is a 1.5s
+window, which occasionally reports a false `stable_settled` for a worker that
+was merely slow. With a receipt there is evidence to wait for, so that window is
+re-armed until the receipt appears, the agent is first seen `working`, or 30s
+pass. A turn that really was a no-op still ends immediately, because its receipt
+is already on disk.
+
 `--receipt` is opt-in. Without it the result keeps its published shape and `ok`
 keeps its previous meaning; with it, `ok` additionally requires an accepted
 receipt.

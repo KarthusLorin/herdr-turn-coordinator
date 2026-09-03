@@ -19,6 +19,13 @@ CLI_PATH = Path.home() / ".local" / "bin" / "herdr-turn"
 # revision-quiet detector below.
 DEFAULT_TURN_TIMEOUT_MS = 1_800_000
 SETTLED_STABILITY_MS = 1_500
+# Without a receipt the wrapper can only guess how long a slow CLI takes to pick
+# up a prompt, and `SETTLED_STABILITY_MS` is that guess. With one there is real
+# evidence to wait for, so the stability window is re-armed until the file lands
+# -- bounded here rather than by the turn ceiling, so a worker that never writes
+# a receipt surfaces in seconds instead of holding the dispatcher for the whole
+# turn budget.
+RECEIPT_SETTLE_GRACE_MS = 30_000
 # ponytail: a TUI needs a moment to repaint between keys of a gate sequence.
 GATE_KEY_SETTLE_S = 0.4
 
@@ -114,6 +121,18 @@ def receipt_snapshot(path):
     except OSError:
         return None
     return [stat.st_mtime_ns, stat.st_size, stat.st_ino]
+
+
+def receipt_landed(plan):
+    """Has this turn's receipt appeared yet? The freshness rule is the one
+    `verify_receipt` applies, so a leftover file from an earlier attempt can
+    never end the wait early."""
+    if plan is None:
+        return True
+    current = receipt_snapshot(plan.path)
+    if current is None:
+        return False
+    return current != plan.baseline and current[0] >= plan.started_ns
 
 
 def normalize_artifact(entry):
@@ -413,7 +432,18 @@ def clear_startup_gates(pane_id, kind=None):
     return cleared
 
 
-def confirm_stable_settled(target, info, deadline):
+def confirm_stable_settled(target, info, deadline, plan=None):
+    # A pane still idle right after the prompt landed is ambiguous: the CLI may
+    # be slow to pick the turn up, or the turn may be genuinely over. Only until
+    # the agent is first seen `working` -- after that a settle is a real settle,
+    # and re-arming would only delay it.
+    #
+    # Without a receipt the sole tiebreak is time, so one `SETTLED_STABILITY_MS`
+    # window decides and a slow CLI is misread as a finished turn. With one there
+    # is evidence to wait for, so the window is re-armed until the receipt lands
+    # or `pickup_deadline` passes.
+    pickup_deadline = min(deadline, time.monotonic() + RECEIPT_SETTLE_GRACE_MS / 1000)
+    observed_working = False
     while info.get("agent_status") in {"idle", "done"}:
         remaining = int((deadline - time.monotonic()) * 1000)
         if remaining <= 0:
@@ -425,6 +455,14 @@ def confirm_stable_settled(target, info, deadline):
         )
         if resumed.returncode:
             if payload(resumed).get("error", {}).get("code") == "timeout":
+                still_ambiguous = (
+                    plan is not None
+                    and not observed_working
+                    and not receipt_landed(plan)
+                    and time.monotonic() < pickup_deadline
+                )
+                if still_ambiguous:
+                    continue
                 return info, "stable_settled"
             fail("agent_settled_confirmation_failed", detail=payload(resumed))
 
@@ -433,6 +471,7 @@ def confirm_stable_settled(target, info, deadline):
             return info, "blocked"
         if info.get("agent_status") != "working":
             fail("agent_settled_confirmation_unexpected", detail=payload(resumed))
+        observed_working = True
 
         remaining = int((deadline - time.monotonic()) * 1000)
         if remaining <= 0:
@@ -446,7 +485,7 @@ def confirm_stable_settled(target, info, deadline):
     return info, "blocked" if info.get("agent_status") == "blocked" else "native_wait"
 
 
-def wait_for_quiet(target, pane_id, delivered_revision, timeout):
+def wait_for_quiet(target, pane_id, delivered_revision, timeout, plan=None):
     deadline = time.monotonic() + max(0, timeout - 5000) / 1000
     revision = delivered_revision
     last_change = time.monotonic()
@@ -468,7 +507,7 @@ def wait_for_quiet(target, pane_id, delivered_revision, timeout):
                 fail("agent_wait_failed", timed_out=timed_out_code(detail), detail=detail)
             info = payload(settled).get("result", {}).get("agent", {})
             if info.get("agent_status") in {"idle", "done"}:
-                info, wait_mode = confirm_stable_settled(target, info, deadline)
+                info, wait_mode = confirm_stable_settled(target, info, deadline, plan)
                 return info.get("agent_status", "idle"), wait_mode
             return info.get("agent_status", "idle"), "native_wait"
         current = info.get("revision", revision)
@@ -554,7 +593,9 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
                 and (status_confirms_delivery or screen_confirms_delivery)
             )
         ):
-            status, wait_mode = wait_for_quiet(target, agent["pane_id"], agent["revision"], timeout)
+            status, wait_mode = wait_for_quiet(
+                target, agent["pane_id"], agent["revision"], timeout, plan,
+            )
             final_text = read_once(target, lines) if wait_mode == "native_wait" and status in {"idle", "done"} else read_visible(target)
             emit(
                 status, agent["pane_id"], agent.get("name"), wait_mode, final_text,
@@ -574,7 +615,7 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
     wait_mode = "native_wait"
     if status in {"idle", "done"}:
         deadline = time.monotonic() + timeout / 1000
-        info, wait_mode = confirm_stable_settled(target, info, deadline)
+        info, wait_mode = confirm_stable_settled(target, info, deadline, plan)
         status = info.get("agent_status")
     text = read_once(target, lines) if status in {"idle", "done"} else read_visible(target)
     emit(
