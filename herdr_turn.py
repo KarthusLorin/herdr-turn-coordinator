@@ -149,20 +149,23 @@ def check_artifacts(entries, expected, started_ns):
 
 def check_consistency(data, status):
     """Syntax-level contradictions inside a receipt. A worker that claims
-    `completed` while listing unfinished work, or reports a stop without saying
-    why, has produced a receipt no recovery step can act on."""
+    `completed` while listing unfinished work, or ends a turn without saying
+    why, has produced a receipt no recovery step can act on. Every status owes
+    a reason: on a stop it names the blocker, and on `completed` it is the one
+    line a reader has to judge the claim by."""
     if status not in RECEIPT_STATUSES:
         return f"status must be one of {sorted(RECEIPT_STATUSES)}, got {status!r}"
     remaining = data.get("remaining")
     if remaining is not None and not isinstance(remaining, list):
         return "remaining must be a list"
-    if status == RECEIPT_TERMINAL_STATUS:
-        if remaining:
-            return "completed receipt still lists remaining work"
-    else:
-        reason = data.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            return f"{status} receipt must give a reason"
+    entries = data.get("artifacts")
+    if entries is not None and not isinstance(entries, list):
+        return "artifacts must be a list"
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return f"{status} receipt must give a reason"
+    if status == RECEIPT_TERMINAL_STATUS and remaining:
+        return "completed receipt still lists remaining work"
     return None
 
 

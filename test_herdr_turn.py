@@ -259,7 +259,7 @@ class ReceiptVerificationTest(unittest.TestCase):
 
     def test_accepts_a_fresh_completed_receipt_with_no_artifacts(self):
         started = time.time_ns()
-        self.write(self.receipt, {"status": "completed", "artifacts": []})
+        self.write(self.receipt, {"status": "completed", "artifacts": [], "reason": "done"})
         report = self.verify(None, started)
         self.assertTrue(report["accepted"])
         self.assertTrue(report["parsable"])
@@ -271,7 +271,7 @@ class ReceiptVerificationTest(unittest.TestCase):
         self.assertEqual(report["problem"], "missing")
 
     def test_rejects_a_receipt_left_over_from_an_earlier_attempt(self):
-        self.write(self.receipt, {"status": "completed", "artifacts": []})
+        self.write(self.receipt, {"status": "completed", "artifacts": [], "reason": "done"})
         baseline = receipt_snapshot(self.receipt)
         started = time.time_ns()
         report = self.verify(baseline, started)
@@ -291,6 +291,7 @@ class ReceiptVerificationTest(unittest.TestCase):
         self.write(self.receipt, {
             "status": "completed",
             "artifacts": [str(self.root / "never-written.md")],
+            "reason": "done",
         })
         report = self.verify(None, started, [self.root / "never-written.md"])
         self.assertFalse(report["accepted"])
@@ -303,6 +304,7 @@ class ReceiptVerificationTest(unittest.TestCase):
         self.write(self.receipt, {
             "status": "completed",
             "artifacts": [str(stale_artifact)],
+            "reason": "done",
         })
         report = self.verify(None, started, [stale_artifact])
         self.assertFalse(report["accepted"])
@@ -325,7 +327,7 @@ class ReceiptVerificationTest(unittest.TestCase):
     def test_rejects_an_expected_artifact_the_worker_never_reported(self):
         started = time.time_ns()
         owed = self.root / "report.md"
-        self.write(self.receipt, {"status": "completed", "artifacts": []})
+        self.write(self.receipt, {"status": "completed", "artifacts": [], "reason": "done"})
         report = self.verify(None, started, [owed])
         self.assertFalse(report["accepted"])
         self.assertEqual(report["problem"], "artifact_unverified")
@@ -335,7 +337,7 @@ class ReceiptVerificationTest(unittest.TestCase):
         started = time.time_ns()
         owed = self.root / "report.md"
         owed.write_text("findings", encoding="utf-8")
-        self.write(self.receipt, {"status": "completed", "artifacts": [str(owed)]})
+        self.write(self.receipt, {"status": "completed", "artifacts": [str(owed)], "reason": "done"})
         report = self.verify(None, started, [owed])
         self.assertTrue(report["accepted"])
         self.assertEqual(report["missing_expected"], [])
@@ -347,7 +349,7 @@ class ReceiptVerificationTest(unittest.TestCase):
         link = self.root / "alias"
         link.symlink_to(self.root, target_is_directory=True)
         self.write(self.receipt, {
-            "status": "completed", "artifacts": [str(link / "report.md")],
+            "status": "completed", "artifacts": [str(link / "report.md")], "reason": "done",
         })
         report = self.verify(None, started, [owed])
         self.assertTrue(report["accepted"])
@@ -355,7 +357,7 @@ class ReceiptVerificationTest(unittest.TestCase):
     def test_rejects_a_completed_receipt_that_still_lists_remaining_work(self):
         started = time.time_ns()
         self.write(self.receipt, {
-            "status": "completed", "artifacts": [], "remaining": ["section 3"],
+            "status": "completed", "artifacts": [], "remaining": ["section 3"], "reason": "done",
         })
         report = self.verify(None, started)
         self.assertFalse(report["accepted"])
@@ -364,6 +366,22 @@ class ReceiptVerificationTest(unittest.TestCase):
     def test_rejects_a_stopped_receipt_that_gives_no_reason(self):
         started = time.time_ns()
         self.write(self.receipt, {"status": "blocked", "artifacts": []})
+        report = self.verify(None, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "inconsistent")
+
+    def test_rejects_a_completed_receipt_that_gives_no_reason(self):
+        started = time.time_ns()
+        self.write(self.receipt, {"status": "completed", "artifacts": []})
+        report = self.verify(None, started)
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["problem"], "inconsistent")
+
+    def test_rejects_a_receipt_whose_artifacts_are_not_a_list(self):
+        started = time.time_ns()
+        self.write(self.receipt, {
+            "status": "completed", "artifacts": "report.md", "reason": "done",
+        })
         report = self.verify(None, started)
         self.assertFalse(report["accepted"])
         self.assertEqual(report["problem"], "inconsistent")
@@ -416,7 +434,7 @@ class ReceiptEmitTest(unittest.TestCase):
         # wrapper actually sees.
         started = time.time_ns()
         self.receipt.write_text(
-            json.dumps({"status": "completed", "artifacts": []}), encoding="utf-8"
+            json.dumps({"status": "completed", "artifacts": [], "reason": "done"}), encoding="utf-8"
         )
         payload, code = self.emit_once("done", self.receipt, started)
         self.assertTrue(payload["ok"])

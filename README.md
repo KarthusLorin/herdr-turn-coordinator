@@ -124,13 +124,18 @@ result:
 }
 ```
 
-`problem` is one of `missing`, `stale`, `unparsable`, `not_completed`, or
-`artifact_unverified`. A receipt is accepted only when it appeared during this
-turn, parses as a JSON object, reports `status: "completed"`, and every path in
-`artifacts` exists and was modified during the turn. A receipt left behind by an
-earlier attempt is rejected as `stale`, so reusing a receipt path across retries
-cannot produce a false success. An empty `artifacts` list is legitimate for
-investigation or review turns that deliver only the receipt.
+`problem` is one of `missing`, `stale`, `unparsable`, `inconsistent`,
+`not_completed`, or `artifact_unverified`. A receipt is accepted only when it
+appeared during this turn, parses as a JSON object, carries all four fields —
+`status: "completed"`, a list `artifacts`, an empty or absent `remaining`, and a
+non-empty `reason` — and every path in `artifacts` exists and was modified
+during the turn. A receipt that omits `reason`, or whose `artifacts` or
+`remaining` is not a list, is rejected as `inconsistent`: a worker that cannot
+say why it stopped has produced nothing a recovery step can act on, whatever its
+`status` claims. A receipt left behind by an earlier attempt is rejected as
+`stale`, so reusing a receipt path across retries cannot produce a false
+success. An empty `artifacts` list is legitimate for investigation or review
+turns that deliver only the receipt.
 
 `--receipt` is opt-in. Without it the result keeps its published shape and `ok`
 keeps its previous meaning; with it, `ok` additionally requires an accepted
