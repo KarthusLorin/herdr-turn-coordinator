@@ -199,6 +199,7 @@ class PromptDetectionTest(unittest.TestCase):
             patch("herdr_turn.call", side_effect=results) as call,
             patch("herdr_turn.wait_for_quiet", return_value=("done", "native_wait")) as wait,
             patch("herdr_turn.read_once", return_value="PASS"),
+            patch("herdr_turn.mark_delivery") as mark,
             redirect_stdout(io.StringIO()),
         ):
             with self.assertRaisesRegex(SystemExit, "0"):
@@ -210,6 +211,10 @@ class PromptDetectionTest(unittest.TestCase):
             [unittest.mock.call("agent", "send-keys", "reviewer", "enter")],
         )
         wait.assert_called_once_with("reviewer", "pane-1", 0, 1800000, None)
+        self.assertEqual(
+            mark.call_args_list,
+            [unittest.mock.call(None, "delivery_unknown"), unittest.mock.call(None, "delivered")],
+        )
 
     def test_does_not_press_enter_for_another_agent(self):
         prompt = "Review this change and report actionable findings."

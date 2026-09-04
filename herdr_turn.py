@@ -70,6 +70,21 @@ def fail(message, *, timed_out=False, **details):
     raise SystemExit(1)
 
 
+def mark_delivery(receipt, state):
+    if receipt is None or not (receipt.parent / "meta.json").is_file():
+        return
+    helper = Path.home() / ".agents" / "herdr-run"
+    try:
+        result = subprocess.run(
+            [str(helper), "mark", str(receipt.parent), state],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail("dispatch_state_update_failed", state=state, detail=str(error))
+    if result.returncode:
+        fail("dispatch_state_update_failed", state=state, detail=payload(result))
+
+
 def parse_timeout(value):
     value = value.strip().lower()
     match = re.fullmatch(r"(\d+)(ms|s|m)?", value)
@@ -562,6 +577,7 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
     reason = gate_blocking_reason(before.stdout, kind)
     if reason:
         fail("agent_requires_manual_setup", target=target, reason=reason)
+    mark_delivery(receipt, "delivery_unknown")
     result = call("agent", "prompt", target, prompt, "--wait", "--timeout", str(timeout))
     if result.returncode:
         state = call("agent", "get", target)
@@ -574,6 +590,8 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
             and text.returncode == 0
             and contains_new_prompt(before.stdout, text.stdout, prompt)
         )
+        if status_confirms_delivery or screen_confirms_delivery:
+            mark_delivery(receipt, "delivered")
         stalled = prompt_error.get("error", {}).get("code") == "agent_prompt_stalled"
         grok_needs_enter = (
             stalled
@@ -610,6 +628,7 @@ def submit(target, prompt, timeout, lines, baseline_revision, receipt=None, kind
             text=payload(text),
         )
 
+    mark_delivery(receipt, "delivered")
     info = payload(result).get("result", {}).get("agent", {})
     status = info.get("agent_status")
     wait_mode = "native_wait"
