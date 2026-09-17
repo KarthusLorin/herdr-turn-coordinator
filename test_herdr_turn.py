@@ -742,6 +742,94 @@ class ClearStartupGatesTest(unittest.TestCase):
 
 
 class StartupAgentArgsTest(unittest.TestCase):
+    def test_model_reaches_native_start_through_run_parser(self):
+        import herdr_turn
+        cases = [
+            ("claude", "gateway/review-model"),
+            ("claude", "gateway/team-model"),
+            ("codex", "gpt-5.6-sol"),
+            ("claude", None), ("codex", None),
+        ]
+        for kind, model in cases:
+            with self.subTest(kind=kind, model=model):
+                argv = ["herdr-turn", "run", "--kind", kind, "--name", "review", "--prompt", "Review"]
+                if model is not None:
+                    argv += ["--model", model]
+                replies = [
+                    {"result": {"layout": {"area": {"width": 200, "height": 60}}}},
+                    {"result": {"pane": {"pane_id": "worker"}}},
+                    {"result": {"agent": {"revision": 1}}},
+                ]
+                with (
+                    patch.object(sys, "argv", argv),
+                    patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "caller"}),
+                    patch("herdr_turn.call", side_effect=[subprocess.CompletedProcess([], 0, json.dumps(r), "") for r in replies]) as call,
+                    patch("herdr_turn.clear_startup_gates"),
+                    patch("herdr_turn.submit", side_effect=SystemExit(0)),
+                    self.assertRaises(SystemExit),
+                ):
+                    herdr_turn.main()
+                args = call.call_args.args
+                expected = ("--dangerously-bypass-hook-trust",) if kind == "codex" else ()
+                if model is not None:
+                    expected += ("--model", model)
+                self.assertEqual(args, ("agent", "start", "review", "--kind", kind, "--pane", "worker", "--timeout", "300000") + (("--", *expected) if expected else ()))
+
+    def test_effort_reaches_native_start_without_changing_environment(self):
+        import herdr_turn
+        for effort in ("low", "high"):
+            with self.subTest(effort=effort):
+                argv = ["herdr-turn", "run", "--kind", "claude", "--name", "tagger",
+                        "--model", "gateway/tagging-model", "--effort", effort,
+                        "--prompt", "Label"]
+                replies = [
+                    {"result": {"layout": {"area": {"width": 200, "height": 60}}}},
+                    {"result": {"pane": {"pane_id": "worker"}}},
+                    {"result": {"agent": {"revision": 1}}},
+                ]
+                with (
+                    patch.object(sys, "argv", argv),
+                    patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "caller"}),
+                    patch("herdr_turn.call", side_effect=[subprocess.CompletedProcess([], 0, json.dumps(r), "") for r in replies]) as call,
+                    patch("herdr_turn.clear_startup_gates"),
+                    patch("herdr_turn.submit", side_effect=SystemExit(0)),
+                    self.assertRaises(SystemExit),
+                ):
+                    original_env = dict(os.environ)
+                    try:
+                        herdr_turn.main()
+                    finally:
+                        self.assertEqual(dict(os.environ), original_env)
+                self.assertEqual(call.call_args.args[-5:],
+                                 ("--", "--model", "gateway/tagging-model", "--effort", effort))
+
+    def test_invalid_effort_requests_fail_before_pane_creation(self):
+        import herdr_turn
+        for command in [
+            ["run", "--kind", "codex", "--effort", "low"],
+            ["run", "--kind", "kimi", "--effort", "high"],
+            ["run", "--kind", "claude", "--effort", "minimal"],
+            ["prompt", "--target", "tagger", "--effort", "low"],
+        ]:
+            with self.subTest(command=command), patch.object(sys, "argv", ["herdr-turn", *command, "--prompt", "Label"]), patch("herdr_turn.call") as call, patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+                herdr_turn.main()
+            self.assertEqual(error.exception.code, 2)
+            call.assert_not_called()
+
+    def test_invalid_model_requests_fail_before_any_herdr_call(self):
+        import herdr_turn
+        for command in [
+            ["run", "--kind", "kimi", "--model", "some-model"],
+            ["run", "--kind", "claude", "--model", ""],
+            ["run", "--kind", "claude", "--model=-bad"],
+            ["run", "--kind", "claude", "--model", "bad\nmodel"],
+            ["prompt", "--target", "review", "--model", "some-model"],
+        ]:
+            with self.subTest(command=command), patch.object(sys, "argv", ["herdr-turn", *command, "--prompt", "Review"]), patch("herdr_turn.call") as call, patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+                herdr_turn.main()
+            self.assertEqual(error.exception.code, 2)
+            call.assert_not_called()
+
     def test_passes_the_official_bypass_to_the_clis_that_have_it(self):
         self.assertEqual(startup_agent_args("codex"), ("--dangerously-bypass-hook-trust",))
         self.assertEqual(startup_agent_args("traecli"), ("--dangerously-bypass-hook-trust",))

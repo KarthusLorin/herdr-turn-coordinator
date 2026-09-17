@@ -72,6 +72,32 @@ herdr-turn run \
 
 For Claude Code, Grok, Gemini, or Kimi, use `--kind claude`, `--kind grok`, `--kind gemini`, or `--kind kimi`.
 
+Select a model for a new Claude Code or Codex session without changing shared
+CLI configuration:
+
+```sh
+herdr-turn run --kind claude --model gateway/team-model --name seed-review --prompt "Review the diff."
+herdr-turn run --kind codex --model my-codex-model --name sol-worker --prompt "Implement the task."
+```
+
+`--model` is forwarded as one native argument through `herdr agent start --`.
+Omitting it preserves the CLI default and existing startup flags. Only `claude`
+and `codex` support this option here; Trae uses `herdr-trae-turn --model`.
+`prompt` does not accept `--model`: continue the same session without changing
+its model. Model/provider availability and orchestration eligibility remain the
+caller's responsibility; accepting a model slug does not verify provider access.
+
+For a new Claude Code session, pin effort without changing shared settings:
+
+```sh
+herdr-turn run --kind claude --model sonnet --effort low --name tagger --prompt "Label the input."
+```
+
+`--effort` accepts `low`, `medium`, `high`, `xhigh`, or `max` and is forwarded to
+Claude's native session-only flag. It is supported only by `run --kind claude`;
+`prompt` keeps the existing session's effort. Omitting it preserves the CLI's
+configured effort. Argument forwarding does not verify a provider's reasoning behavior.
+
 Continue an existing settled agent:
 
 ```sh

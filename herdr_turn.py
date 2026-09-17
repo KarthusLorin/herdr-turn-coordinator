@@ -678,11 +678,32 @@ STARTUP_AGENT_ARGS = {
 }
 
 
-def startup_agent_args(kind):
-    return STARTUP_AGENT_ARGS.get(kind, ())
+MODEL_KINDS = {"claude", "codex"}
 
 
-def start_agent(kind, name, timeout):
+def model_arg(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]*", value):
+        raise argparse.ArgumentTypeError("model must be a nonempty model name or slug")
+    return value
+
+
+def startup_agent_args(kind, model=None, effort=None):
+    extra = STARTUP_AGENT_ARGS.get(kind, ())
+    if model is not None:
+        if kind not in MODEL_KINDS:
+            raise ValueError("--model is supported only for claude and codex")
+        extra += ("--model", model_arg(model))
+    if effort is not None:
+        if kind != "claude":
+            raise ValueError("--effort is supported only for claude")
+        if effort not in {"low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("unsupported Claude effort level")
+        extra += ("--effort", effort)
+    return extra
+
+
+def start_agent(kind, name, timeout, model=None, effort=None):
+    extra = startup_agent_args(kind, model, effort)
     layout = call("pane", "layout", "--pane", os.environ["HERDR_PANE_ID"])
     if layout.returncode:
         fail("pane_layout_failed", detail=payload(layout))
@@ -697,7 +718,6 @@ def start_agent(kind, name, timeout):
     pane_id = payload(split)["result"]["pane"]["pane_id"]
 
     start_timeout = str(min(max(timeout, 3001), 300000))
-    extra = startup_agent_args(kind)
     passthrough = ("--", *extra) if extra else ()
     started = call("agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", start_timeout, *passthrough)
     if started.returncode and payload(started).get("error", {}).get("code") == "agent_pane_busy":
@@ -733,6 +753,8 @@ def main():
 
     run = sub.add_parser("run")
     run.add_argument("--kind", required=True)
+    run.add_argument("--model", type=model_arg, help="model for this new claude/codex session only; omit to keep the CLI default")
+    run.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), help="effort for this new Claude session only")
     run.add_argument("--prompt", required=True)
     run.add_argument("--name")
     run.add_argument(
@@ -760,6 +782,12 @@ def main():
     sub.add_parser("install-cli")
     sub.add_parser("uninstall-cli")
     args = parser.parse_args()
+
+    if args.command == "run" and args.model is not None and args.kind not in MODEL_KINDS:
+        parser.error("--model is supported only for claude and codex; use herdr-trae-turn for Trae")
+
+    if args.command == "run" and args.effort is not None and args.kind != "claude":
+        parser.error("--effort is supported only for claude")
 
     if args.command in {"run", "prompt"}:
         # Whether a turn owes files is the dispatcher's call, made before the
@@ -803,7 +831,7 @@ def main():
 
     if args.command == "run":
         name = args.name or f"{args.kind}turn_{os.getpid()}"
-        pane_id, revision = start_agent(args.kind, name, args.timeout)
+        pane_id, revision = start_agent(args.kind, name, args.timeout, args.model, args.effort)
         # ponytail: answer the known pre-composer gates before the prompt is typed,
         # so a trust dialog never swallows it. Runs only here, at startup -- never
         # around a prompt the worker is already handling.
