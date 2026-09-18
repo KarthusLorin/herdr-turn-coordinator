@@ -748,7 +748,8 @@ class StartupAgentArgsTest(unittest.TestCase):
             ("claude", "gateway/review-model"),
             ("claude", "gateway/team-model"),
             ("codex", "gpt-5.6-sol"),
-            ("claude", None), ("codex", None),
+            ("opencode", "opencode/muse-spark-1.3-contributor-free"),
+            ("claude", None), ("codex", None), ("opencode", None),
         ]
         for kind, model in cases:
             with self.subTest(kind=kind, model=model):
@@ -807,6 +808,7 @@ class StartupAgentArgsTest(unittest.TestCase):
         import herdr_turn
         for command in [
             ["run", "--kind", "codex", "--effort", "low"],
+            ["run", "--kind", "opencode", "--effort", "high"],
             ["run", "--kind", "kimi", "--effort", "high"],
             ["run", "--kind", "claude", "--effort", "minimal"],
             ["prompt", "--target", "tagger", "--effort", "low"],
@@ -823,6 +825,7 @@ class StartupAgentArgsTest(unittest.TestCase):
             ["run", "--kind", "claude", "--model", ""],
             ["run", "--kind", "claude", "--model=-bad"],
             ["run", "--kind", "claude", "--model", "bad\nmodel"],
+            ["run", "--kind", "opencode", "--model", "bad\nmodel"],
             ["prompt", "--target", "review", "--model", "some-model"],
         ]:
             with self.subTest(command=command), patch.object(sys, "argv", ["herdr-turn", *command, "--prompt", "Review"]), patch("herdr_turn.call") as call, patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
