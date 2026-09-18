@@ -678,7 +678,7 @@ STARTUP_AGENT_ARGS = {
 }
 
 
-MODEL_KINDS = {"claude", "codex"}
+MODEL_KINDS = {"claude", "codex", "opencode"}
 
 
 def model_arg(value):
@@ -691,7 +691,7 @@ def startup_agent_args(kind, model=None, effort=None):
     extra = STARTUP_AGENT_ARGS.get(kind, ())
     if model is not None:
         if kind not in MODEL_KINDS:
-            raise ValueError("--model is supported only for claude and codex")
+            raise ValueError("--model is supported only for claude, codex, and opencode")
         extra += ("--model", model_arg(model))
     if effort is not None:
         if kind != "claude":
@@ -753,7 +753,7 @@ def main():
 
     run = sub.add_parser("run")
     run.add_argument("--kind", required=True)
-    run.add_argument("--model", type=model_arg, help="model for this new claude/codex session only; omit to keep the CLI default")
+    run.add_argument("--model", type=model_arg, help="model for this new claude/codex/opencode session only; omit to keep the CLI default")
     run.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), help="effort for this new Claude session only")
     run.add_argument("--prompt", required=True)
     run.add_argument("--name")
@@ -784,7 +784,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run" and args.model is not None and args.kind not in MODEL_KINDS:
-        parser.error("--model is supported only for claude and codex; use herdr-trae-turn for Trae")
+        parser.error("--model is supported only for claude, codex, and opencode; use herdr-trae-turn for Trae")
 
     if args.command == "run" and args.effort is not None and args.kind != "claude":
         parser.error("--effort is supported only for claude")
